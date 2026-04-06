@@ -2,10 +2,10 @@
 name = "luck"
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Hamza Zubair <hamzamohdzubair@gmail.com>"]
 description = "A random learning resource picker - opens books, videos, and courses at random locations to spark curiosity"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/yourusername/luck"
+repository = "https://github.com/hamzamohdzubair/luck"
 keywords = ["learning", "random", "education", "cli", "productivity"]
 categories = ["command-line-utilities"]
 
