@@ -18,3 +18,4 @@ opener = "0.7"
 anyhow = "1.0"
 dirs = "5.0"
 shellexpand = "3.1"
+rusqlite = { version = "0.31", features = ["bundled"] }
