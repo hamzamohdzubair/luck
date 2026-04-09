@@ -31,6 +31,9 @@ enum LsCommands {
     Playlists,
     /// List individual PDF files across all configured folders
     Pdf,
+    /// List non-YouTube links
+    #[command(alias = "l")]
+    Links,
 }
 
 #[derive(Subcommand)]
@@ -49,7 +52,7 @@ enum Commands {
     Summary,
     /// Remove an entry by table ID and row ID (e.g. `luck rm 2 5`)
     Rm {
-        /// Table ID: 1=playlists, 2=videos, 3=pdf_folders, 4=books
+        /// Table ID: 1=playlists, 2=videos, 3=pdf_folders, 4=books, 5=links
         table: u32,
         /// Row ID shown in `luck ls`
         id: i64,
@@ -76,6 +79,7 @@ const ID_YT_PLAYLISTS:    u32 = 1;
 const ID_YT_VIDEOS:       u32 = 2;
 const ID_PDF_FOLDERS:    u32 = 3;
 const ID_PHYSICAL_BOOKS: u32 = 4;
+const ID_LINKS:          u32 = 5;
 
 struct TableMeta {
     id:    u32,
@@ -132,6 +136,11 @@ fn open_db() -> Result<Connection> {
             path  TEXT PRIMARY KEY,
             pages INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS links (
+            id   INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            url  TEXT NOT NULL UNIQUE
+        );
     ")?;
     // Idempotent migration — silently ignored if column already exists
     let _ = conn.execute_batch(
@@ -140,12 +149,13 @@ fn open_db() -> Result<Connection> {
     Ok(conn)
 }
 
-fn table_counts(conn: &Connection) -> Result<[usize; 4]> {
+fn table_counts(conn: &Connection) -> Result<[usize; 5]> {
     let counts = [
         conn.query_row("SELECT COUNT(*) FROM yt_playlists",                [], |r| r.get(0))?,
         conn.query_row("SELECT COUNT(*) FROM yt_videos",                   [], |r| r.get(0))?,
         conn.query_row("SELECT COALESCE(SUM(pdf_count), 0) FROM pdf_scan_cache", [], |r| r.get(0))?,
         conn.query_row("SELECT COUNT(*) FROM physical_books",              [], |r| r.get(0))?,
+        conn.query_row("SELECT COUNT(*) FROM links",                       [], |r| r.get(0))?,
     ];
     Ok(counts)
 }
@@ -157,6 +167,7 @@ fn all_table_meta(conn: &Connection) -> Result<Vec<TableMeta>> {
         TableMeta { id: ID_YT_VIDEOS,      name: "videos",    count: counts[1] },
         TableMeta { id: ID_PDF_FOLDERS,    name: "pdf",       count: counts[2] },
         TableMeta { id: ID_PHYSICAL_BOOKS, name: "books",     count: counts[3] },
+        TableMeta { id: ID_LINKS,          name: "links",     count: counts[4] },
     ])
 }
 
@@ -468,8 +479,8 @@ fn parse_table_ids(filter: &str) -> Result<Vec<u32>> {
 
 fn validate_ids(ids: &[u32]) -> Result<()> {
     for &id in ids {
-        if id < 1 || id > 4 {
-            anyhow::bail!("Table ID {} does not exist. Valid IDs are 1-4.", id);
+        if id < 1 || id > 5 {
+            anyhow::bail!("Table ID {} does not exist. Valid IDs are 1-5.", id);
         }
     }
     Ok(())
@@ -483,6 +494,7 @@ enum Resource {
     PhysicalBook { title: String, pages: u32 },
     YouTubePlaylist { name: String, url: String, video_count: Option<usize> },
     YouTubeVideo { name: String, url: String },
+    Link { name: String, url: String },
 }
 
 fn load_resources(conn: &Connection, ids: &[u32]) -> Result<Vec<Resource>> {
@@ -508,6 +520,11 @@ fn load_resources(conn: &Connection, ids: &[u32]) -> Result<Vec<Resource>> {
         let rows = stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,u32>(1)?)))?;
         for row in rows { let (title, pages) = row?; out.push(Resource::PhysicalBook { title, pages }); }
     }
+    if ids.contains(&ID_LINKS) {
+        let mut stmt = conn.prepare("SELECT name, url FROM links")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)))?;
+        for row in rows { let (name, url) = row?; out.push(Resource::Link { name, url }); }
+    }
 
     Ok(out)
 }
@@ -517,7 +534,7 @@ fn load_resources(conn: &Connection, ids: &[u32]) -> Result<Vec<Resource>> {
 fn pick(filter: Option<String>) -> Result<()> {
     let conn = open_db()?;
     let ids: Vec<u32> = match &filter {
-        None => vec![1, 2, 3, 4],
+        None => vec![1, 2, 3, 4, 5],
         Some(f) => {
             let ids = parse_table_ids(f)?;
             validate_ids(&ids)?;
@@ -643,11 +660,21 @@ fn dispatch_resource(resource: &Resource, rng: &mut impl Rng) -> Result<()> {
             println!("🔗 {}", final_url);
             opener::open_browser(&final_url).context("Failed to open browser")?;
         }
+
+        Resource::Link { name, url } => {
+            println!("🔗 {}", name);
+            println!("   {}", url);
+            opener::open_browser(url).context("Failed to open browser")?;
+        }
     }
     Ok(())
 }
 
 // ── yt-dlp helpers ───────────────────────────────────────────────────────────
+
+fn is_youtube_url(url: &str) -> bool {
+    url.contains("youtube.com") || url.contains("youtu.be")
+}
 
 fn yt_is_playlist(url: &str) -> bool {
     // A URL with /playlist? is unambiguously a playlist.
@@ -786,6 +813,19 @@ fn add(from_clipboard: bool, dir: Option<String>, pages: Option<u32>, name: Opti
         let url = get_clipboard()?;
         if !url.starts_with("http://") && !url.starts_with("https://") {
             anyhow::bail!("Clipboard content doesn't look like a URL: {}", url);
+        }
+
+        if !is_youtube_url(&url) {
+            // Non-YouTube link — store in links table
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM links WHERE url = ?1", params![url], |r| r.get::<_,u32>(0)
+            ).map(|c| c > 0)?;
+            if exists { anyhow::bail!("Already in Links: {}", url); }
+
+            let resolved_name = name.unwrap_or_else(|| url.clone());
+            conn.execute("INSERT INTO links (name, url) VALUES (?1, ?2)", params![resolved_name, url])?;
+            println!("Added to Links: {}", resolved_name);
+            return Ok(());
         }
 
         let is_playlist = yt_is_playlist(&url);
@@ -959,6 +999,27 @@ fn ls_playlists(conn: &Connection) -> Result<()> {
     print_paged(&lines)
 }
 
+fn ls_links(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT id, name, url FROM links ORDER BY id")?;
+    let rows: Vec<(i64, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    if rows.is_empty() { println!("No links."); return Ok(()); }
+
+    let names: Vec<String> = rows.iter().map(|(_, n, _)| first_line(n).to_string()).collect();
+    let name_w = names.iter().map(|n| n.len()).max().unwrap_or(4).max(4);
+    let url_w  = rows.iter().map(|(_, _, u)| u.len()).max().unwrap_or(3).max(3);
+
+    let mut lines = Vec::new();
+    lines.push(format!(" {:>3}  {:<name_w$}  {}", "ID", "Name", "URL", name_w = name_w));
+    lines.push(format!(" {}  {}  {}", "─".repeat(3), "─".repeat(name_w), "─".repeat(url_w)));
+    for ((id, _, url), name) in rows.iter().zip(names.iter()) {
+        lines.push(format!(" {:>3}  {:<name_w$}  {}", id, name, url, name_w = name_w));
+    }
+    print_paged(&lines)
+}
+
 fn ls_pdf(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("SELECT path FROM pdf_folders ORDER BY id")?;
     let folders: Vec<String> = stmt
@@ -1031,11 +1092,12 @@ fn ls_pdf(conn: &Connection) -> Result<()> {
 fn rm(table: u32, id: i64) -> Result<()> {
     let conn = open_db()?;
     let (table_name, label) = match table {
-        ID_YT_PLAYLISTS     => ("yt_playlists",     "playlist"),
-        ID_YT_VIDEOS        => ("yt_videos",        "video"),
+        ID_YT_PLAYLISTS   => ("yt_playlists",   "playlist"),
+        ID_YT_VIDEOS      => ("yt_videos",      "video"),
         ID_PDF_FOLDERS    => ("pdf_folders",    "PDF folder"),
         ID_PHYSICAL_BOOKS => ("physical_books", "book"),
-        _ => anyhow::bail!("Unknown table ID {}. Valid: 1–4.", table),
+        ID_LINKS          => ("links",          "link"),
+        _ => anyhow::bail!("Unknown table ID {}. Valid: 1–5.", table),
     };
     let affected = conn.execute(
         &format!("DELETE FROM {} WHERE id = ?1", table_name),
@@ -1062,6 +1124,7 @@ fn main() -> Result<()> {
                 Some(LsCommands::Videos)    => ls_videos(&conn)?,
                 Some(LsCommands::Playlists) => ls_playlists(&conn)?,
                 Some(LsCommands::Pdf)       => ls_pdf(&conn)?,
+                Some(LsCommands::Links)     => ls_links(&conn)?,
             }
         }
         Commands::Rm { table, id } => rm(table, id)?,
@@ -1159,7 +1222,7 @@ mod tests {
 
     #[test]
     fn validate_ids_too_high() {
-        assert!(validate_ids(&[5]).is_err());
+        assert!(validate_ids(&[6]).is_err());
     }
 
     // ── yt_is_playlist ────────────────────────────────────────────────────────
