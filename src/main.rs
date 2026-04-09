@@ -127,6 +127,10 @@ fn open_db() -> Result<Connection> {
             url           TEXT PRIMARY KEY,
             duration_secs INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS pdf_file_cache (
+            path  TEXT PRIMARY KEY,
+            pages INTEGER NOT NULL
+        );
     ")?;
     // Idempotent migration — silently ignored if column already exists
     let _ = conn.execute_batch(
@@ -951,9 +955,20 @@ fn ls_pdf(conn: &Connection) -> Result<()> {
                 .cmp(&b.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
         });
         for path in pdfs {
-            let pages = lopdf::Document::load(&path).ok()
-                .map(|d| d.get_pages().len() as u64)
-                .unwrap_or(0);
+            let key = path.to_string_lossy().into_owned();
+            let pages: u64 = conn.query_row(
+                "SELECT pages FROM pdf_file_cache WHERE path = ?1",
+                params![key], |r| r.get(0),
+            ).ok().unwrap_or_else(|| {
+                let p = lopdf::Document::load(&path).ok()
+                    .map(|d| d.get_pages().len() as u64)
+                    .unwrap_or(0);
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO pdf_file_cache (path, pages) VALUES (?1, ?2)",
+                    params![key, p as i64],
+                );
+                p
+            });
             let name = path.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
