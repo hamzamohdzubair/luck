@@ -4,8 +4,9 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use rusqlite::{Connection, params};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
 #[derive(Parser)]
@@ -19,11 +20,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum LsCommands {
     /// List physical books
+    #[command(alias = "b")]
     Books,
     /// List YouTube videos
+    #[command(alias = "v")]
     Videos,
     /// List YouTube playlists with video counts
+    #[command(alias = "p")]
     Playlists,
+    /// List individual PDF files across all configured folders
+    Pdf,
 }
 
 #[derive(Subcommand)]
@@ -40,6 +46,13 @@ enum Commands {
     /// Summarise each source in depth (PDF counts, video hours, book pages)
     #[command(alias = "sum")]
     Summary,
+    /// Remove an entry by table ID and row ID (e.g. `luck rm 2 5`)
+    Rm {
+        /// Table ID: 1=playlists, 2=videos, 3=pdf_folders, 4=books
+        table: u32,
+        /// Row ID shown in `luck ls`
+        id: i64,
+    },
     /// Add an entry (type is inferred from flags)
     Add {
         /// Pick URL from clipboard (auto-detects playlist vs video)
@@ -51,9 +64,6 @@ enum Commands {
         /// Page count (physical book)
         #[arg(short = 'p', long = "pages")]
         pages: Option<u32>,
-        /// Section counts per chapter, e.g. 3,5,6,7 (structured book)
-        #[arg(short = 's', long = "sections")]
-        sections: Option<String>,
         /// Name/title (auto-detected from URL for -l if omitted)
         #[arg(short = 'n', long = "name")]
         name: Option<String>,
@@ -63,9 +73,8 @@ enum Commands {
 // Fixed table IDs
 const ID_YT_PLAYLISTS:    u32 = 1;
 const ID_YT_VIDEOS:       u32 = 2;
-const ID_PDF_FOLDERS:     u32 = 3;
-const ID_PHYSICAL_BOOKS:  u32 = 4;
-const ID_STRUCTURED_BOOKS:u32 = 5;
+const ID_PDF_FOLDERS:    u32 = 3;
+const ID_PHYSICAL_BOOKS: u32 = 4;
 
 struct TableMeta {
     id:    u32,
@@ -126,13 +135,12 @@ fn open_db() -> Result<Connection> {
     Ok(conn)
 }
 
-fn table_counts(conn: &Connection) -> Result<[usize; 5]> {
+fn table_counts(conn: &Connection) -> Result<[usize; 4]> {
     let counts = [
-        conn.query_row("SELECT COUNT(*) FROM yt_playlists",    [], |r| r.get(0))?,
-        conn.query_row("SELECT COUNT(*) FROM yt_videos",       [], |r| r.get(0))?,
-        conn.query_row("SELECT COUNT(*) FROM pdf_folders",     [], |r| r.get(0))?,
-        conn.query_row("SELECT COUNT(*) FROM physical_books",  [], |r| r.get(0))?,
-        conn.query_row("SELECT COUNT(*) FROM structured_books",[], |r| r.get(0))?,
+        conn.query_row("SELECT COUNT(*) FROM yt_playlists",                [], |r| r.get(0))?,
+        conn.query_row("SELECT COUNT(*) FROM yt_videos",                   [], |r| r.get(0))?,
+        conn.query_row("SELECT COALESCE(SUM(pdf_count), 0) FROM pdf_scan_cache", [], |r| r.get(0))?,
+        conn.query_row("SELECT COUNT(*) FROM physical_books",              [], |r| r.get(0))?,
     ];
     Ok(counts)
 }
@@ -140,11 +148,10 @@ fn table_counts(conn: &Connection) -> Result<[usize; 5]> {
 fn all_table_meta(conn: &Connection) -> Result<Vec<TableMeta>> {
     let counts = table_counts(conn)?;
     Ok(vec![
-        TableMeta { id: ID_YT_PLAYLISTS,     name: "YouTube Playlists", count: counts[0] },
-        TableMeta { id: ID_YT_VIDEOS,        name: "YouTube Videos",    count: counts[1] },
-        TableMeta { id: ID_PDF_FOLDERS,      name: "PDF Folders",       count: counts[2] },
-        TableMeta { id: ID_PHYSICAL_BOOKS,   name: "Physical Books",    count: counts[3] },
-        TableMeta { id: ID_STRUCTURED_BOOKS, name: "Structured Books",  count: counts[4] },
+        TableMeta { id: ID_YT_PLAYLISTS,   name: "playlists", count: counts[0] },
+        TableMeta { id: ID_YT_VIDEOS,      name: "videos",    count: counts[1] },
+        TableMeta { id: ID_PDF_FOLDERS,    name: "pdf",       count: counts[2] },
+        TableMeta { id: ID_PHYSICAL_BOOKS, name: "books",     count: counts[3] },
     ])
 }
 
@@ -378,13 +385,11 @@ fn sources_summary(conn: &Connection) -> Result<()> {
     println!("Book Sources");
     {
         let grand_total_pages = total_pages as u64 + total_pdf_pages;
-        let phys_count: usize   = conn.query_row("SELECT COUNT(*) FROM physical_books",   [], |r| r.get(0))?;
-        let struct_count: usize = conn.query_row("SELECT COUNT(*) FROM structured_books", [], |r| r.get(0))?;
+        let phys_count: usize = conn.query_row("SELECT COUNT(*) FROM physical_books", [], |r| r.get(0))?;
 
         // (label, count, pages)
         let mut rows: Vec<(String, usize, Option<u64>)> = vec![
-            ("Physical Books".to_string(),   phys_count,   Some(total_pages as u64)),
-            ("Structured Books".to_string(), struct_count, None),
+            ("Physical Books".to_string(), phys_count, Some(total_pages as u64)),
         ];
         for fs in &folder_stats {
             let (count, pages) = if fs.accessible {
@@ -457,8 +462,8 @@ fn parse_table_ids(filter: &str) -> Result<Vec<u32>> {
 
 fn validate_ids(ids: &[u32]) -> Result<()> {
     for &id in ids {
-        if id < 1 || id > 5 {
-            anyhow::bail!("Table ID {} does not exist. Valid IDs are 1-5.", id);
+        if id < 1 || id > 4 {
+            anyhow::bail!("Table ID {} does not exist. Valid IDs are 1-4.", id);
         }
     }
     Ok(())
@@ -470,7 +475,6 @@ fn validate_ids(ids: &[u32]) -> Result<()> {
 enum Resource {
     PdfFolder(PathBuf),
     PhysicalBook { title: String, pages: u32 },
-    StructuredBook { title: String, sections: Vec<u32> },
     YouTubePlaylist { name: String, url: String },
     YouTubeVideo { name: String, url: String },
 }
@@ -498,23 +502,8 @@ fn load_resources(conn: &Connection, ids: &[u32]) -> Result<Vec<Resource>> {
         let rows = stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,u32>(1)?)))?;
         for row in rows { let (title, pages) = row?; out.push(Resource::PhysicalBook { title, pages }); }
     }
-    if ids.contains(&ID_STRUCTURED_BOOKS) {
-        let mut stmt = conn.prepare("SELECT title, sections FROM structured_books")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)))?;
-        for row in rows {
-            let (title, sections_str) = row?;
-            let sections = parse_sections(&sections_str)
-                .with_context(|| format!("Corrupt sections data for '{}'", title))?;
-            out.push(Resource::StructuredBook { title, sections });
-        }
-    }
 
     Ok(out)
-}
-
-fn parse_sections(s: &str) -> Option<Vec<u32>> {
-    let s = s.trim().strip_prefix('[')?.strip_suffix(']')?;
-    s.split(',').map(|n| n.trim().parse().ok()).collect()
 }
 
 // ── Pick ─────────────────────────────────────────────────────────────────────
@@ -522,7 +511,7 @@ fn parse_sections(s: &str) -> Option<Vec<u32>> {
 fn pick(filter: Option<String>) -> Result<()> {
     let conn = open_db()?;
     let ids: Vec<u32> = match &filter {
-        None => vec![1, 2, 3, 4, 5],
+        None => vec![1, 2, 3, 4],
         Some(f) => {
             let ids = parse_table_ids(f)?;
             validate_ids(&ids)?;
@@ -536,7 +525,6 @@ fn pick(filter: Option<String>) -> Result<()> {
         eprintln!("No entries found. Add some with:");
         eprintln!("  luck add -l                     # YouTube video or playlist from clipboard");
         eprintln!("  luck add -n \"Title\" -p 300      # physical book");
-        eprintln!("  luck add -n \"Title\" -s 3,5,6,7  # structured book");
         eprintln!("  luck add -d /path/to/folder     # PDF folder");
         std::process::exit(0);
     }
@@ -632,12 +620,6 @@ fn dispatch_resource(resource: &Resource, rng: &mut impl Rng) -> Result<()> {
         Resource::PhysicalBook { title, pages } => {
             let page = rng.gen_range(1..=*pages);
             println!("📖 Open \"{}\" to page {}/{}", title, page, pages);
-        }
-
-        Resource::StructuredBook { title, sections } => {
-            let chapter = rng.gen_range(0..sections.len());
-            let sec = rng.gen_range(1..=sections[chapter]);
-            println!("📖 Open \"{}\" — Chapter {}, Section {}", title, chapter + 1, sec);
         }
 
         Resource::YouTubePlaylist { name, url } => {
@@ -759,7 +741,7 @@ fn get_clipboard() -> Result<String> {
 
 // ── Add ──────────────────────────────────────────────────────────────────────
 
-fn add(from_clipboard: bool, dir: Option<String>, pages: Option<u32>, section_counts: Option<String>, name: Option<String>) -> Result<()> {
+fn add(from_clipboard: bool, dir: Option<String>, pages: Option<u32>, name: Option<String>) -> Result<()> {
     let conn = open_db()?;
 
     if from_clipboard {
@@ -826,24 +808,8 @@ fn add(from_clipboard: bool, dir: Option<String>, pages: Option<u32>, section_co
         conn.execute("INSERT INTO physical_books (title, pages) VALUES (?1, ?2)", params![title, p])?;
         println!("Added to Physical Books: {} ({} pages)", title, p);
 
-    } else if let Some(s) = section_counts {
-        let title = name.context("Provide -n <title> for structured books.")?;
-        let nums: Vec<u32> = s.split(',')
-            .map(|n: &str| n.trim().parse::<u32>())
-            .collect::<std::result::Result<_, _>>()
-            .context("Sections must be comma-separated integers, e.g. 3,5,6,7")?;
-        let sections_str = format!("[{}]", nums.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", "));
-
-        let exists: bool = conn.query_row(
-            "SELECT COUNT(*) FROM structured_books WHERE title = ?1", params![title], |r| r.get::<_,u32>(0)
-        ).map(|c| c > 0)?;
-        if exists { anyhow::bail!("Already in Structured Books: {}", title); }
-
-        conn.execute("INSERT INTO structured_books (title, sections) VALUES (?1, ?2)", params![title, sections_str])?;
-        println!("Added to Structured Books: {} ({} chapters)", title, nums.len());
-
     } else {
-        anyhow::bail!("Specify one of: -l (link), -d <dir>, -p <pages>, -s <sections>");
+        anyhow::bail!("Specify one of: -l (link), -d <dir>, -p <pages>");
     }
 
     Ok(())
@@ -851,14 +817,29 @@ fn add(from_clipboard: bool, dir: Option<String>, pages: Option<u32>, section_co
 
 // ── Ls ───────────────────────────────────────────────────────────────────────
 
+const PAGER_THRESHOLD: usize = 20;
+
+fn print_paged(lines: &[String]) -> Result<()> {
+    if lines.len() <= PAGER_THRESHOLD {
+        for line in lines { println!("{}", line); }
+        return Ok(());
+    }
+    let mut child = Command::new("less")
+        .arg("-R")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("failed to spawn less")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        for line in lines { writeln!(stdin, "{}", line)?; }
+    }
+    child.wait()?;
+    Ok(())
+}
+
 fn first_line(s: &str) -> &str {
     s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s).trim()
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() }
-    else { format!("{}…", &s[..max.saturating_sub(1)]) }
-}
 
 fn ls_books(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("SELECT id, title, pages FROM physical_books ORDER BY id")?;
@@ -870,16 +851,16 @@ fn ls_books(conn: &Connection) -> Result<()> {
 
     let names: Vec<String> = rows.iter().map(|(_, n, _)| first_line(n).to_string()).collect();
     let name_w  = names.iter().map(|n| n.len()).max().unwrap_or(4).max(4);
-    let count_w = rows.iter().map(|(_, _, p)| p.to_string().len()).max().unwrap_or(5).max(5);
+    let count_w = rows.iter().map(|(_, _, p)| p.to_string().len()).max().unwrap_or(0);
 
-    println!(" {:>3}  {:<name_w$}  {:>count_w$}  Type",
-        "ID", "Name", "Count", name_w = name_w, count_w = count_w);
-    println!(" {}  {}  {}  {}", "─".repeat(3), "─".repeat(name_w), "─".repeat(count_w), "─".repeat(5));
+    let mut lines = Vec::new();
+    lines.push(format!(" {:>3}  {:<name_w$}", "ID", "Name", name_w = name_w));
+    lines.push(format!(" {}  {}  {}  {}", "─".repeat(3), "─".repeat(name_w), "─".repeat(count_w), "─".repeat(5)));
     for ((id, _, pages), name) in rows.iter().zip(names.iter()) {
-        println!(" {:>3}  {:<name_w$}  {:>count_w$}  pages",
-            id, name, pages, name_w = name_w, count_w = count_w);
+        lines.push(format!(" {:>3}  {:<name_w$}  {:>count_w$}  pages",
+            id, name, pages, name_w = name_w, count_w = count_w));
     }
-    Ok(())
+    print_paged(&lines)
 }
 
 fn ls_videos(conn: &Connection) -> Result<()> {
@@ -891,47 +872,130 @@ fn ls_videos(conn: &Connection) -> Result<()> {
     if rows.is_empty() { println!("No videos."); return Ok(()); }
 
     let names: Vec<String> = rows.iter().map(|(_, n, _)| first_line(n).to_string()).collect();
-    let name_w = names.iter().map(|n| n.len()).max().unwrap_or(4).max(4);
+    let durations: Vec<String> = rows.iter().map(|(_, _, url)| {
+        conn.query_row(
+            "SELECT duration_secs FROM yt_duration_cache WHERE url = ?1",
+            params![url], |r| r.get::<_, u64>(0),
+        ).ok().map_or("–".to_string(), |s| format_hm(s))
+    }).collect();
 
-    println!(" {:>3}  {:<name_w$}  URL", "ID", "Name", name_w = name_w);
-    println!(" {}  {}  {}", "─".repeat(3), "─".repeat(name_w), "─".repeat(3));
-    for ((id, _, url), name) in rows.iter().zip(names.iter()) {
-        println!(" {:>3}  {:<name_w$}  {}", id, name, url, name_w = name_w);
+    let name_w = names.iter().map(|n| n.len()).max().unwrap_or(4).max(4);
+    let dur_w  = durations.iter().map(|d| d.len()).max().unwrap_or(0);
+
+    let mut lines = Vec::new();
+    lines.push(format!(" {:>3}  {:<name_w$}", "ID", "Name", name_w = name_w));
+    lines.push(format!(" {}  {}  {}", "─".repeat(3), "─".repeat(name_w), "─".repeat(dur_w)));
+    for (((id, _, _), name), dur) in rows.iter().zip(names.iter()).zip(durations.iter()) {
+        lines.push(format!(" {:>3}  {:<name_w$}  {:>dur_w$}", id, name, dur, name_w = name_w, dur_w = dur_w));
     }
-    Ok(())
+    print_paged(&lines)
 }
 
 fn ls_playlists(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, url, video_count FROM yt_playlists ORDER BY id"
+        "SELECT id, name, video_count FROM yt_playlists ORDER BY id"
     )?;
-    let rows: Vec<(i64, String, String, Option<i64>)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+    let rows: Vec<(i64, String, Option<i64>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
 
     if rows.is_empty() { println!("No playlists."); return Ok(()); }
 
-    const MAX_URL: usize = 60;
-    let names: Vec<String> = rows.iter().map(|(_, n, _, _)| first_line(n).to_string()).collect();
-    let urls:  Vec<String> = rows.iter().map(|(_, _, u, _)| truncate(u, MAX_URL)).collect();
+    let names: Vec<String> = rows.iter().map(|(_, n, _)| first_line(n).to_string()).collect();
     let name_w  = names.iter().map(|n| n.len()).max().unwrap_or(4).max(4);
-    let url_w   = urls.iter().map(|u| u.len()).max().unwrap_or(3).max(3);
     let count_strs: Vec<String> = rows.iter()
-        .map(|(_, _, _, c)| c.map_or("–".to_string(), |n| n.to_string()))
+        .map(|(_, _, c)| c.map_or("–".to_string(), |n| n.to_string()))
         .collect();
-    let count_w = count_strs.iter().map(|s| s.len()).max().unwrap_or(5).max(5);
+    let count_w = count_strs.iter().map(|s| s.len()).max().unwrap_or(0);
 
-    println!(" {:>3}  {:<name_w$}  {:<url_w$}  {:>count_w$}  Type",
-        "ID", "Name", "URL", "Count", name_w = name_w, url_w = url_w, count_w = count_w);
-    println!(" {}  {}  {}  {}  {}",
-        "─".repeat(3), "─".repeat(name_w), "─".repeat(url_w),
-        "─".repeat(count_w), "─".repeat(6));
-    for (((id, _, _, _), name), (url, count_str)) in
-        rows.iter().zip(names.iter()).zip(urls.iter().zip(count_strs.iter()))
+    let mut lines = Vec::new();
+    lines.push(format!(" {:>3}  {:<name_w$}", "ID", "Name", name_w = name_w));
+    lines.push(format!(" {}  {}  {}  {}",
+        "─".repeat(3), "─".repeat(name_w), "─".repeat(count_w), "─".repeat(6)));
+    for ((id, _, _), (name, count_str)) in
+        rows.iter().zip(names.iter().zip(count_strs.iter()))
     {
-        println!(" {:>3}  {:<name_w$}  {:<url_w$}  {:>count_w$}  videos",
-            id, name, url, count_str, name_w = name_w, url_w = url_w, count_w = count_w);
+        lines.push(format!(" {:>3}  {:<name_w$}  {:>count_w$}  videos",
+            id, name, count_str, name_w = name_w, count_w = count_w));
     }
+    print_paged(&lines)
+}
+
+fn ls_pdf(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT path FROM pdf_folders ORDER BY id")?;
+    let folders: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if folders.is_empty() { println!("No PDF folders configured."); return Ok(()); }
+
+    let mut all_pdfs: Vec<(String, u64)> = Vec::new(); // (filename, pages)
+    for stored in &folders {
+        let resolved = wsl_path(std::path::Path::new(stored));
+        if !resolved.exists() {
+            eprintln!("Warning: folder not accessible: {}", stored);
+            continue;
+        }
+        let mut pdfs: Vec<PathBuf> = WalkDir::new(&resolved)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.eq_ignore_ascii_case("pdf"))
+                .unwrap_or(false))
+            .map(|e| e.path().to_path_buf())
+            .collect();
+        pdfs.sort_by(|a, b| {
+            a.file_name().unwrap_or_default().to_string_lossy().to_lowercase()
+                .cmp(&b.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
+        });
+        for path in pdfs {
+            let pages = lopdf::Document::load(&path).ok()
+                .map(|d| d.get_pages().len() as u64)
+                .unwrap_or(0);
+            let name = path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            all_pdfs.push((name, pages));
+        }
+    }
+
+    if all_pdfs.is_empty() { println!("No PDFs found."); return Ok(()); }
+
+    let name_w  = all_pdfs.iter().map(|(n, _)| n.len()).max().unwrap_or(4).max(4);
+    let pages_w = all_pdfs.iter().map(|(_, p)| p.to_string().len()).max().unwrap_or(0);
+    let idx_w   = all_pdfs.len().to_string().len().max(2);
+
+    let mut lines = Vec::new();
+    lines.push(format!(" {:>idx_w$}  {:<name_w$}", "#", "Name", idx_w = idx_w, name_w = name_w));
+    lines.push(format!(" {}  {}  {}  {}", "─".repeat(idx_w), "─".repeat(name_w), "─".repeat(pages_w), "─".repeat(5)));
+    for (i, (name, pages)) in all_pdfs.iter().enumerate() {
+        lines.push(format!(" {:>idx_w$}  {:<name_w$}  {:>pages_w$}  pages",
+            i + 1, name, pages, idx_w = idx_w, name_w = name_w, pages_w = pages_w));
+    }
+    print_paged(&lines)
+}
+
+// ── Rm ───────────────────────────────────────────────────────────────────────
+
+fn rm(table: u32, id: i64) -> Result<()> {
+    let conn = open_db()?;
+    let (table_name, label) = match table {
+        ID_YT_PLAYLISTS     => ("yt_playlists",     "playlist"),
+        ID_YT_VIDEOS        => ("yt_videos",        "video"),
+        ID_PDF_FOLDERS    => ("pdf_folders",    "PDF folder"),
+        ID_PHYSICAL_BOOKS => ("physical_books", "book"),
+        _ => anyhow::bail!("Unknown table ID {}. Valid: 1–4.", table),
+    };
+    let affected = conn.execute(
+        &format!("DELETE FROM {} WHERE id = ?1", table_name),
+        params![id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("No {} with ID {} found.", label, id);
+    }
+    println!("Removed {} #{} from {}.", label, id, table_name);
     Ok(())
 }
 
@@ -948,14 +1012,16 @@ fn main() -> Result<()> {
                 Some(LsCommands::Books)     => ls_books(&conn)?,
                 Some(LsCommands::Videos)    => ls_videos(&conn)?,
                 Some(LsCommands::Playlists) => ls_playlists(&conn)?,
+                Some(LsCommands::Pdf)       => ls_pdf(&conn)?,
             }
         }
+        Commands::Rm { table, id } => rm(table, id)?,
         Commands::Summary => {
             let conn = open_db()?;
             sources_summary(&conn)?;
         }
-        Commands::Add { from_clipboard, dir, pages, sections, name } =>
-            add(from_clipboard, dir, pages, sections, name)?,
+        Commands::Add { from_clipboard, dir, pages, name } =>
+            add(from_clipboard, dir, pages, name)?,
     }
     Ok(())
 }
@@ -1034,7 +1100,7 @@ mod tests {
 
     #[test]
     fn validate_ids_all_valid() {
-        assert!(validate_ids(&[1, 2, 3, 4, 5]).is_ok());
+        assert!(validate_ids(&[1, 2, 3, 4]).is_ok());
     }
 
     #[test]
@@ -1044,7 +1110,7 @@ mod tests {
 
     #[test]
     fn validate_ids_too_high() {
-        assert!(validate_ids(&[6]).is_err());
+        assert!(validate_ids(&[5]).is_err());
     }
 
     // ── yt_is_playlist ────────────────────────────────────────────────────────
@@ -1083,22 +1149,6 @@ mod tests {
     #[test]
     fn first_line_trims_whitespace() { assert_eq!(first_line("  hello  "), "hello"); }
 
-    // ── truncate ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn truncate_short_string_unchanged() {
-        assert_eq!(truncate("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_exact_length_unchanged() {
-        assert_eq!(truncate("hello", 5), "hello");
-    }
-
-    #[test]
-    fn truncate_long_string_gets_ellipsis() {
-        assert_eq!(truncate("hello world", 6), "hello…");
-    }
 
     // ── wsl_path / to_windows_path ────────────────────────────────────────────
 
