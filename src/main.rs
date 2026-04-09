@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 #[derive(Parser)]
 #[command(name = "luck")]
 #[command(about = "Random learning resource picker", long_about = None)]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
