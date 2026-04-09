@@ -232,7 +232,8 @@ fn scan_pdf_folder(path: &std::path::Path) -> (usize, u64) {
 
 fn fetch_playlist_total_duration(url: &str) -> u64 {
     let output = Command::new("yt-dlp")
-        .args(["--flat-playlist", "--print", "duration", url])
+        .args(["--quiet", "--flat-playlist", "--print", "duration", url])
+        .stderr(Stdio::null())
         .output();
     match output {
         Ok(out) if out.status.success() => {
@@ -479,7 +480,7 @@ fn validate_ids(ids: &[u32]) -> Result<()> {
 enum Resource {
     PdfFolder(PathBuf),
     PhysicalBook { title: String, pages: u32 },
-    YouTubePlaylist { name: String, url: String },
+    YouTubePlaylist { name: String, url: String, video_count: Option<usize> },
     YouTubeVideo { name: String, url: String },
 }
 
@@ -487,9 +488,9 @@ fn load_resources(conn: &Connection, ids: &[u32]) -> Result<Vec<Resource>> {
     let mut out = Vec::new();
 
     if ids.contains(&ID_YT_PLAYLISTS) {
-        let mut stmt = conn.prepare("SELECT name, url FROM yt_playlists")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)))?;
-        for row in rows { let (name, url) = row?; out.push(Resource::YouTubePlaylist { name, url }); }
+        let mut stmt = conn.prepare("SELECT name, url, video_count FROM yt_playlists")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,Option<usize>>(2)?)))?;
+        for row in rows { let (name, url, video_count) = row?; out.push(Resource::YouTubePlaylist { name, url, video_count }); }
     }
     if ids.contains(&ID_YT_VIDEOS) {
         let mut stmt = conn.prepare("SELECT name, url FROM yt_videos")?;
@@ -626,9 +627,9 @@ fn dispatch_resource(resource: &Resource, rng: &mut impl Rng) -> Result<()> {
             println!("📖 Open \"{}\" to page {}/{}", title, page, pages);
         }
 
-        Resource::YouTubePlaylist { name, url } => {
+        Resource::YouTubePlaylist { name, url, video_count } => {
             println!("🎬 {}", name);
-            let (video_url, n, total) = pick_random_playlist_video(url)?;
+            let (video_url, n, total) = pick_random_playlist_video(url, *video_count)?;
             println!("📺 Lecture {}/{}", n, total);
             let final_url = with_random_timestamp(&video_url, rng);
             println!("🔗 {}", final_url);
@@ -662,7 +663,8 @@ fn yt_is_playlist(url: &str) -> bool {
 fn fetch_yt_title(url: &str, is_playlist: bool) -> Option<String> {
     let field = if is_playlist { "playlist_title" } else { "title" };
     let output = Command::new("yt-dlp")
-        .args(["--print", field, "--no-playlist", url])
+        .args(["--quiet", "--print", field, "--no-playlist", url])
+        .stderr(Stdio::null())
         .output().ok()?;
     if output.status.success() {
         let t = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -671,9 +673,36 @@ fn fetch_yt_title(url: &str, is_playlist: bool) -> Option<String> {
     None
 }
 
+/// Fetch playlist title and total video count in a single yt-dlp call.
+/// --playlist-items 1 fetches only the first entry (fast), while
+/// playlist_count is the extractor-reported total and is not affected by
+/// the --playlist-items filter (unlike n_entries which reflects the slice).
+fn fetch_playlist_info(url: &str) -> (Option<String>, Option<usize>) {
+    let output = Command::new("yt-dlp")
+        .args(["--quiet", "--flat-playlist", "--playlist-items", "1",
+               "--print", "playlist_title", "--print", "playlist_count", url])
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut lines = text.lines();
+            let title = lines.next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s != "NA");
+            let count = lines.next()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0);
+            (title, count)
+        }
+        _ => (None, None),
+    }
+}
+
 fn get_video_duration(url: &str) -> Option<u64> {
     let output = Command::new("yt-dlp")
-        .args(["--print", "duration", "--no-playlist", url])
+        .args(["--quiet", "--print", "duration", "--no-playlist", url])
+        .stderr(Stdio::null())
         .output().ok()?;
     String::from_utf8_lossy(&output.stdout).trim()
         .parse::<f64>().ok().map(|d| d as u64)
@@ -698,26 +727,30 @@ fn with_random_timestamp(url: &str, rng: &mut impl Rng) -> String {
     }
 }
 
-fn fetch_playlist_video_count(url: &str) -> Option<usize> {
-    let output = Command::new("yt-dlp")
-        .args(["--flat-playlist", "--print", "url", url])
-        .output().ok()?;
-    let count = String::from_utf8_lossy(&output.stdout)
-        .lines().filter(|l| !l.is_empty()).count();
-    if count > 0 { Some(count) } else { None }
-}
 
-fn pick_random_playlist_video(url: &str) -> Result<(String, usize, usize)> {
+fn pick_random_playlist_video(url: &str, video_count: Option<usize>) -> Result<(String, usize, usize)> {
+    if let Some(total) = video_count {
+        let idx = rand::thread_rng().gen_range(1..=total);
+        let output = Command::new("yt-dlp")
+            .args(["--quiet", "--flat-playlist", "--playlist-items", &idx.to_string(), "--print", "url", url])
+            .stderr(Stdio::null())
+            .output()
+            .context("Failed to run yt-dlp (is it installed?)")?;
+        let video_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !video_url.is_empty() {
+            return Ok((video_url, idx, total));
+        }
+        // stale count — fall through to full enumeration
+    }
+    // Fallback: enumerate everything (video_count unknown or stale)
     let output = Command::new("yt-dlp")
-        .args(["--flat-playlist", "--print", "url", url])
+        .args(["--quiet", "--flat-playlist", "--print", "url", url])
+        .stderr(Stdio::null())
         .output()
         .context("Failed to run yt-dlp (is it installed?)")?;
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     let urls: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
-
     if urls.is_empty() { anyhow::bail!("No videos found in playlist"); }
-
     let total = urls.len();
     let idx = rand::thread_rng().gen_range(0..total);
     Ok((urls[idx].to_string(), idx + 1, total))
@@ -769,25 +802,25 @@ fn add(from_clipboard: bool, dir: Option<String>, pages: Option<u32>, name: Opti
             if exists { anyhow::bail!("Already in YouTube Videos: {}", url); }
         }
 
-        let resolved_name = if let Some(n) = name {
-            n
-        } else {
-            eprint!("Fetching title...");
-            let t = fetch_yt_title(&url, is_playlist).unwrap_or_else(|| url.clone());
-            eprintln!(" done");
-            t
-        };
-
         if is_playlist {
-            eprint!("Fetching video count...");
-            let video_count = fetch_playlist_video_count(&url);
+            eprint!("Fetching playlist info...");
+            let (title, count) = fetch_playlist_info(&url);
             eprintln!(" done");
+            let resolved_name = name.or(title).unwrap_or_else(|| url.clone());
             conn.execute(
                 "INSERT INTO yt_playlists (name, url, video_count) VALUES (?1, ?2, ?3)",
-                params![resolved_name, url, video_count],
+                params![resolved_name, url, count],
             )?;
             println!("Added to YouTube Playlists: {}", resolved_name);
         } else {
+            let resolved_name = if let Some(n) = name {
+                n
+            } else {
+                eprint!("Fetching title...");
+                let t = fetch_yt_title(&url, false).unwrap_or_else(|| url.clone());
+                eprintln!(" done");
+                t
+            };
             conn.execute("INSERT INTO yt_videos (name, url) VALUES (?1, ?2)", params![resolved_name, url])?;
             println!("Added to YouTube Videos: {}", resolved_name);
         }
