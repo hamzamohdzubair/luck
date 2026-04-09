@@ -17,12 +17,13 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-enum SourcesCommands {
-    /// List all sources with their IDs and entry counts
-    Ls,
-    /// Summarise each source (PDF counts, video hours, book pages)
-    #[command(alias = "sum")]
-    Summary,
+enum LsCommands {
+    /// List physical books
+    Books,
+    /// List YouTube videos
+    Videos,
+    /// List YouTube playlists with video counts
+    Playlists,
 }
 
 #[derive(Subcommand)]
@@ -31,11 +32,14 @@ enum Commands {
     Pick {
         filter: Option<String>,
     },
-    /// Manage and inspect learning sources
-    Sources {
+    /// List sources. Without a subcommand shows counts per type
+    Ls {
         #[command(subcommand)]
-        subcommand: SourcesCommands,
+        subcommand: Option<LsCommands>,
     },
+    /// Summarise each source in depth (PDF counts, video hours, book pages)
+    #[command(alias = "sum")]
+    Summary,
     /// Add an entry (type is inferred from flags)
     Add {
         /// Pick URL from clipboard (auto-detects playlist vs video)
@@ -110,7 +114,15 @@ fn open_db() -> Result<Connection> {
             pdf_count   INTEGER NOT NULL,
             total_pages INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS yt_duration_cache (
+            url           TEXT PRIMARY KEY,
+            duration_secs INTEGER NOT NULL
+        );
     ")?;
+    // Idempotent migration — silently ignored if column already exists
+    let _ = conn.execute_batch(
+        "ALTER TABLE yt_playlists ADD COLUMN video_count INTEGER;"
+    );
     Ok(conn)
 }
 
@@ -245,7 +257,6 @@ fn sources_summary(conn: &Connection) -> Result<()> {
     let video_count: usize    = conn.query_row("SELECT COUNT(*) FROM yt_videos",    [], |r| r.get(0))?;
 
     let (playlist_secs, video_secs) = if playlist_count > 0 || video_count > 0 {
-        eprintln!("Fetching video durations via yt-dlp (this may take a moment)...");
         let mut pl_secs: u64 = 0;
         if playlist_count > 0 {
             let mut stmt = conn.prepare("SELECT url FROM yt_playlists")?;
@@ -253,7 +264,22 @@ fn sources_summary(conn: &Connection) -> Result<()> {
                 .filter_map(|r| r.ok())
                 .collect();
             for url in &urls {
-                pl_secs += fetch_playlist_total_duration(url);
+                let cached: Option<u64> = conn.query_row(
+                    "SELECT duration_secs FROM yt_duration_cache WHERE url = ?1",
+                    params![url], |r| r.get(0),
+                ).ok();
+                let secs = if let Some(s) = cached {
+                    s
+                } else {
+                    eprintln!("Fetching duration for playlist (will be cached)...");
+                    let s = fetch_playlist_total_duration(url);
+                    conn.execute(
+                        "INSERT OR REPLACE INTO yt_duration_cache (url, duration_secs) VALUES (?1, ?2)",
+                        params![url, s as i64],
+                    )?;
+                    s
+                };
+                pl_secs += secs;
             }
         }
         let mut vid_secs: u64 = 0;
@@ -263,7 +289,22 @@ fn sources_summary(conn: &Connection) -> Result<()> {
                 .filter_map(|r| r.ok())
                 .collect();
             for url in &urls {
-                vid_secs += get_video_duration(url).unwrap_or(0);
+                let cached: Option<u64> = conn.query_row(
+                    "SELECT duration_secs FROM yt_duration_cache WHERE url = ?1",
+                    params![url], |r| r.get(0),
+                ).ok();
+                let secs = if let Some(s) = cached {
+                    s
+                } else {
+                    eprintln!("Fetching duration for video (will be cached)...");
+                    let s = get_video_duration(url).unwrap_or(0);
+                    conn.execute(
+                        "INSERT OR REPLACE INTO yt_duration_cache (url, duration_secs) VALUES (?1, ?2)",
+                        params![url, s as i64],
+                    )?;
+                    s
+                };
+                vid_secs += secs;
             }
         }
         (pl_secs, vid_secs)
@@ -671,6 +712,15 @@ fn with_random_timestamp(url: &str, rng: &mut impl Rng) -> String {
     }
 }
 
+fn fetch_playlist_video_count(url: &str) -> Option<usize> {
+    let output = Command::new("yt-dlp")
+        .args(["--flat-playlist", "--print", "url", url])
+        .output().ok()?;
+    let count = String::from_utf8_lossy(&output.stdout)
+        .lines().filter(|l| !l.is_empty()).count();
+    if count > 0 { Some(count) } else { None }
+}
+
 fn pick_random_playlist_video(url: &str) -> Result<(String, usize, usize)> {
     let output = Command::new("yt-dlp")
         .args(["--flat-playlist", "--print", "url", url])
@@ -743,7 +793,13 @@ fn add(from_clipboard: bool, dir: Option<String>, pages: Option<u32>, section_co
         };
 
         if is_playlist {
-            conn.execute("INSERT INTO yt_playlists (name, url) VALUES (?1, ?2)", params![resolved_name, url])?;
+            eprint!("Fetching video count...");
+            let video_count = fetch_playlist_video_count(&url);
+            eprintln!(" done");
+            conn.execute(
+                "INSERT INTO yt_playlists (name, url, video_count) VALUES (?1, ?2, ?3)",
+                params![resolved_name, url, video_count],
+            )?;
             println!("Added to YouTube Playlists: {}", resolved_name);
         } else {
             conn.execute("INSERT INTO yt_videos (name, url) VALUES (?1, ?2)", params![resolved_name, url])?;
@@ -793,21 +849,286 @@ fn add(from_clipboard: bool, dir: Option<String>, pages: Option<u32>, section_co
     Ok(())
 }
 
+// ── Ls ───────────────────────────────────────────────────────────────────────
+
+fn first_line(s: &str) -> &str {
+    s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s).trim()
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() }
+    else { format!("{}…", &s[..max.saturating_sub(1)]) }
+}
+
+fn ls_books(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT id, title, pages FROM physical_books ORDER BY id")?;
+    let rows: Vec<(i64, String, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    if rows.is_empty() { println!("No books."); return Ok(()); }
+
+    let names: Vec<String> = rows.iter().map(|(_, n, _)| first_line(n).to_string()).collect();
+    let name_w  = names.iter().map(|n| n.len()).max().unwrap_or(4).max(4);
+    let count_w = rows.iter().map(|(_, _, p)| p.to_string().len()).max().unwrap_or(5).max(5);
+
+    println!(" {:>3}  {:<name_w$}  {:>count_w$}  Type",
+        "ID", "Name", "Count", name_w = name_w, count_w = count_w);
+    println!(" {}  {}  {}  {}", "─".repeat(3), "─".repeat(name_w), "─".repeat(count_w), "─".repeat(5));
+    for ((id, _, pages), name) in rows.iter().zip(names.iter()) {
+        println!(" {:>3}  {:<name_w$}  {:>count_w$}  pages",
+            id, name, pages, name_w = name_w, count_w = count_w);
+    }
+    Ok(())
+}
+
+fn ls_videos(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT id, name, url FROM yt_videos ORDER BY id")?;
+    let rows: Vec<(i64, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    if rows.is_empty() { println!("No videos."); return Ok(()); }
+
+    let names: Vec<String> = rows.iter().map(|(_, n, _)| first_line(n).to_string()).collect();
+    let name_w = names.iter().map(|n| n.len()).max().unwrap_or(4).max(4);
+
+    println!(" {:>3}  {:<name_w$}  URL", "ID", "Name", name_w = name_w);
+    println!(" {}  {}  {}", "─".repeat(3), "─".repeat(name_w), "─".repeat(3));
+    for ((id, _, url), name) in rows.iter().zip(names.iter()) {
+        println!(" {:>3}  {:<name_w$}  {}", id, name, url, name_w = name_w);
+    }
+    Ok(())
+}
+
+fn ls_playlists(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, url, video_count FROM yt_playlists ORDER BY id"
+    )?;
+    let rows: Vec<(i64, String, String, Option<i64>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    if rows.is_empty() { println!("No playlists."); return Ok(()); }
+
+    const MAX_URL: usize = 60;
+    let names: Vec<String> = rows.iter().map(|(_, n, _, _)| first_line(n).to_string()).collect();
+    let urls:  Vec<String> = rows.iter().map(|(_, _, u, _)| truncate(u, MAX_URL)).collect();
+    let name_w  = names.iter().map(|n| n.len()).max().unwrap_or(4).max(4);
+    let url_w   = urls.iter().map(|u| u.len()).max().unwrap_or(3).max(3);
+    let count_strs: Vec<String> = rows.iter()
+        .map(|(_, _, _, c)| c.map_or("–".to_string(), |n| n.to_string()))
+        .collect();
+    let count_w = count_strs.iter().map(|s| s.len()).max().unwrap_or(5).max(5);
+
+    println!(" {:>3}  {:<name_w$}  {:<url_w$}  {:>count_w$}  Type",
+        "ID", "Name", "URL", "Count", name_w = name_w, url_w = url_w, count_w = count_w);
+    println!(" {}  {}  {}  {}  {}",
+        "─".repeat(3), "─".repeat(name_w), "─".repeat(url_w),
+        "─".repeat(count_w), "─".repeat(6));
+    for (((id, _, _, _), name), (url, count_str)) in
+        rows.iter().zip(names.iter()).zip(urls.iter().zip(count_strs.iter()))
+    {
+        println!(" {:>3}  {:<name_w$}  {:<url_w$}  {:>count_w$}  videos",
+            id, name, url, count_str, name_w = name_w, url_w = url_w, count_w = count_w);
+    }
+    Ok(())
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Pick { filter } => pick(filter)?,
-        Commands::Sources { subcommand } => {
+        Commands::Ls { subcommand } => {
             let conn = open_db()?;
             match subcommand {
-                SourcesCommands::Ls      => print_sources_ls(&conn)?,
-                SourcesCommands::Summary => sources_summary(&conn)?,
+                None                          => print_sources_ls(&conn)?,
+                Some(LsCommands::Books)     => ls_books(&conn)?,
+                Some(LsCommands::Videos)    => ls_videos(&conn)?,
+                Some(LsCommands::Playlists) => ls_playlists(&conn)?,
             }
+        }
+        Commands::Summary => {
+            let conn = open_db()?;
+            sources_summary(&conn)?;
         }
         Commands::Add { from_clipboard, dir, pages, sections, name } =>
             add(from_clipboard, dir, pages, sections, name)?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── fmt_num ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_num_zero() { assert_eq!(fmt_num(0), "0"); }
+
+    #[test]
+    fn fmt_num_under_thousand() { assert_eq!(fmt_num(999), "999"); }
+
+    #[test]
+    fn fmt_num_exact_thousand() { assert_eq!(fmt_num(1000), "1,000"); }
+
+    #[test]
+    fn fmt_num_millions() { assert_eq!(fmt_num(1_234_567), "1,234,567"); }
+
+    // ── format_hm ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_hm_zero() { assert_eq!(format_hm(0), "0h 00m"); }
+
+    #[test]
+    fn format_hm_one_hour() { assert_eq!(format_hm(3600), "1h 00m"); }
+
+    #[test]
+    fn format_hm_mixed() { assert_eq!(format_hm(7384), "2h 03m"); }
+
+    #[test]
+    fn format_hm_seconds_truncated() { assert_eq!(format_hm(3661), "1h 01m"); }
+
+    // ── format_duration ───────────────────────────────────────────────────────
+
+    #[test]
+    fn format_duration_under_minute() { assert_eq!(format_duration(59), "0:59"); }
+
+    #[test]
+    fn format_duration_exact_minute() { assert_eq!(format_duration(60), "1:00"); }
+
+    #[test]
+    fn format_duration_with_hours() { assert_eq!(format_duration(3661), "1:01:01"); }
+
+    // ── parse_table_ids ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_ids_single() {
+        assert_eq!(parse_table_ids("3").unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn parse_ids_range() {
+        assert_eq!(parse_table_ids("1-4").unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn parse_ids_list() {
+        assert_eq!(parse_table_ids("1,3,5").unwrap(), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn parse_ids_dedup_and_sort() {
+        assert_eq!(parse_table_ids("3,1,1,2").unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_ids_invalid_errors() {
+        assert!(parse_table_ids("abc").is_err());
+    }
+
+    // ── validate_ids ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_ids_all_valid() {
+        assert!(validate_ids(&[1, 2, 3, 4, 5]).is_ok());
+    }
+
+    #[test]
+    fn validate_ids_zero_invalid() {
+        assert!(validate_ids(&[0]).is_err());
+    }
+
+    #[test]
+    fn validate_ids_too_high() {
+        assert!(validate_ids(&[6]).is_err());
+    }
+
+    // ── yt_is_playlist ────────────────────────────────────────────────────────
+
+    #[test]
+    fn yt_playlist_url() {
+        assert!(yt_is_playlist("https://www.youtube.com/playlist?list=PLxxx"));
+    }
+
+    #[test]
+    fn yt_watch_url_is_not_playlist() {
+        assert!(!yt_is_playlist("https://www.youtube.com/watch?v=abc123"));
+    }
+
+    #[test]
+    fn yt_youtu_be_is_not_playlist() {
+        assert!(!yt_is_playlist("https://youtu.be/abc123"));
+    }
+
+    #[test]
+    fn yt_watch_with_list_param_is_not_playlist() {
+        assert!(!yt_is_playlist("https://www.youtube.com/watch?v=abc&list=PLxxx"));
+    }
+
+    // ── first_line ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn first_line_single() { assert_eq!(first_line("hello"), "hello"); }
+
+    #[test]
+    fn first_line_multiline() { assert_eq!(first_line("hello\nworld"), "hello"); }
+
+    #[test]
+    fn first_line_skips_blank_leading() { assert_eq!(first_line("\nhello"), "hello"); }
+
+    #[test]
+    fn first_line_trims_whitespace() { assert_eq!(first_line("  hello  "), "hello"); }
+
+    // ── truncate ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_length_unchanged() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string_gets_ellipsis() {
+        assert_eq!(truncate("hello world", 6), "hello…");
+    }
+
+    // ── wsl_path / to_windows_path ────────────────────────────────────────────
+
+    #[test]
+    fn wsl_path_converts_windows_drive() {
+        let p = std::path::Path::new(r"C:\Users\foo");
+        assert_eq!(wsl_path(p), PathBuf::from("/mnt/c/Users/foo"));
+    }
+
+    #[test]
+    fn wsl_path_lowercase_drive() {
+        let p = std::path::Path::new(r"g:\books");
+        assert_eq!(wsl_path(p), PathBuf::from("/mnt/g/books"));
+    }
+
+    #[test]
+    fn wsl_path_unix_path_unchanged() {
+        let p = std::path::Path::new("/home/user/docs");
+        assert_eq!(wsl_path(p), PathBuf::from("/home/user/docs"));
+    }
+
+    #[test]
+    fn to_windows_path_converts_mnt() {
+        let p = PathBuf::from("/mnt/c/Users/foo");
+        assert_eq!(to_windows_path(&p), PathBuf::from(r"C:\Users\foo"));
+    }
+
+    #[test]
+    fn to_windows_path_non_mnt_unchanged() {
+        let p = PathBuf::from("/home/user/docs");
+        assert_eq!(to_windows_path(&p), PathBuf::from("/home/user/docs"));
+    }
 }
