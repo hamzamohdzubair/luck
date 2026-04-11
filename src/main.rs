@@ -184,15 +184,79 @@ fn all_table_meta(conn: &Connection) -> Result<Vec<TableMeta>> {
 }
 
 fn print_sources_ls(conn: &Connection) -> Result<()> {
-    let tables = all_table_meta(conn)?;
-    let name_w = tables.iter().map(|t| t.name.len()).max().unwrap_or(4);
-    let header = format!(" {:<3}  {:<name_w$}  {}", "ID", "Name", "Entries");
+    // ── Playlists ──────────────────────────────────────────────────────────────
+    let pl_count: i64 = conn.query_row("SELECT COUNT(*) FROM yt_playlists", [], |r| r.get(0))?;
+    let pl_videos: i64 = conn.query_row("SELECT COALESCE(SUM(video_count), 0) FROM yt_playlists", [], |r| r.get(0))?;
+    let pl_secs: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(d.duration_secs), 0) FROM yt_playlists p JOIN yt_duration_cache d ON d.url = p.url",
+        [], |r| r.get(0),
+    ).unwrap_or(0);
+    let pl_desc = if pl_secs > 0 {
+        format!("{}P, {}V, {}H", pl_count, pl_videos, pl_secs / 3600)
+    } else {
+        format!("{}P, {}V", pl_count, pl_videos)
+    };
+
+    // ── Videos ────────────────────────────────────────────────────────────────
+    let vid_count: i64 = conn.query_row("SELECT COUNT(*) FROM yt_videos", [], |r| r.get(0))?;
+    let vid_secs: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(d.duration_secs), 0) FROM yt_videos v JOIN yt_duration_cache d ON d.url = v.url",
+        [], |r| r.get(0),
+    ).unwrap_or(0);
+    let vid_desc = if vid_secs > 0 {
+        format!("{}V, {}H", vid_count, vid_secs / 3600)
+    } else {
+        format!("{}V", vid_count)
+    };
+
+    // ── PDF folders ───────────────────────────────────────────────────────────
+    let pdf_folders: i64 = conn.query_row("SELECT COUNT(*) FROM pdf_folders", [], |r| r.get(0))?;
+    let pdf_docs: i64 = conn.query_row("SELECT COALESCE(SUM(pdf_count), 0) FROM pdf_scan_cache", [], |r| r.get(0))?;
+    let pdf_pages: i64 = conn.query_row("SELECT COALESCE(SUM(total_pages), 0) FROM pdf_scan_cache", [], |r| r.get(0))?;
+    let pdf_desc = if pdf_docs > 0 {
+        format!("{}F, {}D, {}P", pdf_folders, pdf_docs, pdf_pages)
+    } else {
+        format!("{}F", pdf_folders)
+    };
+
+    // ── Books ─────────────────────────────────────────────────────────────────
+    let book_count: i64 = conn.query_row("SELECT COUNT(*) FROM physical_books", [], |r| r.get(0))?;
+    let book_pages: i64 = conn.query_row("SELECT COALESCE(SUM(pages), 0) FROM physical_books", [], |r| r.get(0))?;
+    let book_desc = format!("{}B, {}P", book_count, book_pages);
+
+    // ── Links ─────────────────────────────────────────────────────────────────
+    let link_count: i64 = conn.query_row("SELECT COUNT(*) FROM links", [], |r| r.get(0))?;
+    let link_desc = format!("{}L", link_count);
+
+    // ── Pick counts ───────────────────────────────────────────────────────────
+    let pick_counts: Vec<i64> = (1u32..=5).map(|id| {
+        conn.query_row(
+            "SELECT pick_count FROM table_pick_counts WHERE table_id = ?1",
+            params![id], |r| r.get(0),
+        ).unwrap_or(0)
+    }).collect();
+
+    let rows: Vec<(u32, &str, String, i64)> = vec![
+        (ID_YT_PLAYLISTS,   "playlists", pl_desc,   pick_counts[0]),
+        (ID_YT_VIDEOS,      "videos",    vid_desc,   pick_counts[1]),
+        (ID_PDF_FOLDERS,    "pdf",       pdf_desc,   pick_counts[2]),
+        (ID_PHYSICAL_BOOKS, "books",     book_desc,  pick_counts[3]),
+        (ID_LINKS,          "links",     link_desc,  pick_counts[4]),
+    ];
+
+    let name_w  = rows.iter().map(|(_, n, _, _)| n.len()).max().unwrap_or(4);
+    let desc_w  = rows.iter().map(|(_, _, d, _)| d.len()).max().unwrap_or(7).max(7);
+    let picks_w = rows.iter().map(|(_, _, _, p)| p.to_string().len()).max().unwrap_or(5).max(5);
+
+    let header = format!(" {:<3}  {:<name_w$}  {:<desc_w$}  {:>picks_w$}",
+        "ID", "Name", "Entries", "Picks", name_w = name_w, desc_w = desc_w, picks_w = picks_w);
     let sep = "─".repeat(header.len());
     println!("{}", sep);
     println!("{}", header);
     println!("{}", sep);
-    for t in &tables {
-        println!(" {:<3}  {:<name_w$}  {}", t.id, t.name, t.count);
+    for (id, name, desc, picks) in &rows {
+        println!(" {:<3}  {:<name_w$}  {:<desc_w$}  {:>picks_w$}",
+            id, name, desc, picks, name_w = name_w, desc_w = desc_w, picks_w = picks_w);
     }
     println!("{}", sep);
     Ok(())
