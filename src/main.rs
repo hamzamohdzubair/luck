@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use rand::distributions::{Distribution, WeightedIndex};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use rusqlite::{Connection, params};
@@ -141,7 +142,18 @@ fn open_db() -> Result<Connection> {
             name TEXT NOT NULL,
             url  TEXT NOT NULL UNIQUE
         );
+        CREATE TABLE IF NOT EXISTS table_pick_counts (
+            table_id   INTEGER PRIMARY KEY,
+            pick_count INTEGER NOT NULL DEFAULT 0
+        );
     ")?;
+    let _ = conn.execute_batch("
+        INSERT OR IGNORE INTO table_pick_counts (table_id, pick_count) VALUES (1, 0);
+        INSERT OR IGNORE INTO table_pick_counts (table_id, pick_count) VALUES (2, 0);
+        INSERT OR IGNORE INTO table_pick_counts (table_id, pick_count) VALUES (3, 0);
+        INSERT OR IGNORE INTO table_pick_counts (table_id, pick_count) VALUES (4, 0);
+        INSERT OR IGNORE INTO table_pick_counts (table_id, pick_count) VALUES (5, 0);
+    ");
     // Idempotent migration — silently ignored if column already exists
     let _ = conn.execute_batch(
         "ALTER TABLE yt_playlists ADD COLUMN video_count INTEGER;"
@@ -531,6 +543,24 @@ fn load_resources(conn: &Connection, ids: &[u32]) -> Result<Vec<Resource>> {
 
 // ── Pick ─────────────────────────────────────────────────────────────────────
 
+fn load_pick_counts(conn: &Connection, ids: &[u32]) -> Result<Vec<i64>> {
+    ids.iter().map(|&id| {
+        conn.query_row(
+            "SELECT pick_count FROM table_pick_counts WHERE table_id = ?1",
+            params![id],
+            |r| r.get(0),
+        ).map_err(anyhow::Error::from)
+    }).collect()
+}
+
+fn increment_pick_count(conn: &Connection, table_id: u32) -> Result<()> {
+    conn.execute(
+        "UPDATE table_pick_counts SET pick_count = pick_count + 1 WHERE table_id = ?1",
+        params![table_id],
+    )?;
+    Ok(())
+}
+
 fn pick(filter: Option<String>) -> Result<()> {
     let conn = open_db()?;
     let ids: Vec<u32> = match &filter {
@@ -542,9 +572,16 @@ fn pick(filter: Option<String>) -> Result<()> {
         }
     };
 
-    let resources = load_resources(&conn, &ids)?;
+    // Load resources per-table; exclude empty tables from selection.
+    let mut non_empty: Vec<(u32, Vec<Resource>)> = Vec::new();
+    for &id in &ids {
+        let resources = load_resources(&conn, &[id])?;
+        if !resources.is_empty() {
+            non_empty.push((id, resources));
+        }
+    }
 
-    if resources.is_empty() {
+    if non_empty.is_empty() {
         eprintln!("No entries found. Add some with:");
         eprintln!("  luck add -l                     # YouTube video or playlist from clipboard");
         eprintln!("  luck add -n \"Title\" -p 300      # physical book");
@@ -552,10 +589,21 @@ fn pick(filter: Option<String>) -> Result<()> {
         std::process::exit(0);
     }
 
-    let mut rng = rand::thread_rng();
-    let resource = resources.choose(&mut rng).unwrap();
+    // Weight each non-empty table by 1/(pick_count + 1).
+    let non_empty_ids: Vec<u32> = non_empty.iter().map(|(id, _)| *id).collect();
+    let counts = load_pick_counts(&conn, &non_empty_ids)?;
+    let weights: Vec<f64> = counts.iter().map(|&c| 1.0 / (c as f64 + 1.0)).collect();
 
-    dispatch_resource(resource, &mut rng)
+    let mut rng = rand::thread_rng();
+    let dist = WeightedIndex::new(&weights).expect("weights are valid");
+    let chosen_idx = dist.sample(&mut rng);
+    let (chosen_table_id, ref resources) = non_empty[chosen_idx];
+
+    let resource = resources.choose(&mut rng).unwrap();
+    dispatch_resource(resource, &mut rng)?;
+
+    increment_pick_count(&conn, chosen_table_id)?;
+    Ok(())
 }
 
 /// Find SumatraPDF.exe, checking fixed locations then asking PowerShell.
