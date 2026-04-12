@@ -975,6 +975,13 @@ fn add(from_clipboard: bool, dir: Option<String>, pages: Option<u32>, name: Opti
                 t
             };
             conn.execute("INSERT INTO yt_videos (name, url) VALUES (?1, ?2)", params![resolved_name, url])?;
+            eprint!("Fetching duration...");
+            let dur = get_video_duration(&url).unwrap_or(0);
+            conn.execute(
+                "INSERT OR REPLACE INTO yt_duration_cache (url, duration_secs) VALUES (?1, ?2)",
+                params![url, dur as i64],
+            )?;
+            eprintln!(" done");
             println!("Added to YouTube Videos: {}", resolved_name);
         }
 
