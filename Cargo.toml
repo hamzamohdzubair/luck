@@ -1,6 +1,6 @@
 [package]
 name = "luck"
-version = "1.5.1"
+version = "1.5.2"
 edition = "2021"
 authors = ["Hamza Zubair <hamzamohdzubair@gmail.com>"]
 description = "A random learning resource picker - opens books, videos, and courses at random locations to spark curiosity"
