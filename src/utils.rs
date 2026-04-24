@@ -30,7 +30,33 @@ pub fn wsl_path(path: &std::path::Path) -> PathBuf {
     path.to_path_buf()
 }
 
-#[allow(dead_code)]
+pub fn is_wsl() -> bool {
+    std::fs::read_to_string("/proc/version")
+        .map(|v| v.to_lowercase().contains("microsoft"))
+        .unwrap_or(false)
+}
+
+pub fn to_windows_path_any(path: &PathBuf) -> PathBuf {
+    if !is_wsl() { return path.clone(); }
+    let out = std::process::Command::new("wslpath")
+        .args(["-w", &path.to_string_lossy()])
+        .output();
+    if let Ok(o) = out {
+        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if !s.is_empty() { return PathBuf::from(s); }
+    }
+    path.clone()
+}
+
+pub fn books_dir() -> PathBuf {
+    let dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("luck")
+        .join("books");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 pub fn fmt_num(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();

@@ -1,11 +1,14 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
-use walkdir::WalkDir;
 
 use crate::db::open_db;
-use crate::llm::{build_pdf_metadata, get_folder_topic_tags, prompt_and_apply_topic_tags, prompt_link_type_tags};
-use crate::resources::{TYPE_LINK, TYPE_PDF, TYPE_BOOK, TYPE_PLAYLIST, TYPE_VIDEO};
-use crate::tags::{apply_named_tags, apply_type_tags};
+use crate::llm::{build_pdf_folder_metadata, prompt_and_apply_topic_tags, prompt_link_type_tags, suggest_topic_tags};
+use crate::resources::{
+    TYPE_LINK, TYPE_PDF, TYPE_BOOK, TYPE_PLAYLIST, TYPE_VIDEO,
+    scan_pdfs, scan_pdfs_win, extract_pdf_metadata, copy_pdf_to_store,
+};
+use crate::tags::{apply_type_tags, apply_named_tags};
+use crate::utils::{is_wsl, to_windows_path, wsl_path};
 use crate::yt::{
     fetch_playlist_info, fetch_yt_title, get_video_duration, get_clipboard, is_youtube_url, yt_is_playlist,
 };
@@ -178,80 +181,194 @@ fn add_yt_video(conn: &Connection, url: String, name: Option<String>) -> Result<
 
 fn add_pdf_folder(conn: &Connection, path: String) -> Result<()> {
     let expanded = shellexpand::tilde(&path).to_string();
-    let folder = std::path::Path::new(&expanded);
-    if !folder.is_dir() {
-        anyhow::bail!("Not a directory: {}", expanded);
+    let expanded = expanded.trim_end_matches(['/', '\\']).to_string();
+    let wsl_folder = wsl_path(std::path::Path::new(&expanded));
+    let win_folder = to_windows_path(&wsl_folder);
+
+    // Check: folder already tracked?
+    let tracked: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tracked_folders WHERE path=?1",
+            params![expanded],
+            |r| r.get::<_, u32>(0),
+        )
+        .map(|c| c > 0)?;
+    if tracked {
+        anyhow::bail!("PDF folder already tracked: {}", expanded);
     }
 
-    let pdfs: Vec<std::path::PathBuf> = WalkDir::new(folder)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|x| x.to_str())
-                .map(|x| x.eq_ignore_ascii_case("pdf"))
-                .unwrap_or(false)
-        })
-        .map(|e| e.path().to_path_buf())
-        .collect();
+    // Hard error: subfolder or superset of already-tracked folder
+    let tracked_paths: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT path FROM tracked_folders")?;
+        let rows: Vec<String> = stmt.query_map([], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    };
+    let sep = if expanded.contains('\\') { '\\' } else { '/' };
+    let new_prefix = format!("{}{}", expanded, sep);
+    for existing in &tracked_paths {
+        let existing_prefix = format!("{}{}", existing, sep);
+        if expanded.starts_with(&existing_prefix) {
+            anyhow::bail!(
+                "'{}' is a subfolder of already-tracked '{}'. \
+                 This would cause duplicate PDFs in the database.",
+                expanded, existing
+            );
+        } else if existing.starts_with(&new_prefix) {
+            anyhow::bail!(
+                "Already-tracked '{}' is a subfolder of '{}'. \
+                 This would cause duplicate PDFs in the database.",
+                existing, expanded
+            );
+        }
+    }
 
-    if pdfs.is_empty() {
+    // Scan PDFs
+    let pdf_pairs: Vec<(std::path::PathBuf, std::path::PathBuf)> = {
+        let wsl_pdfs = scan_pdfs(&wsl_folder);
+        if !wsl_pdfs.is_empty() {
+            wsl_pdfs.iter().map(|p| (p.clone(), to_windows_path(p))).collect()
+        } else if is_wsl() {
+            let win_pdfs = scan_pdfs_win(&win_folder);
+            win_pdfs.iter().map(|p| (std::path::PathBuf::new(), p.clone())).collect()
+        } else {
+            vec![]
+        }
+    };
+
+    if pdf_pairs.is_empty() {
         anyhow::bail!("No PDF files found in: {}", expanded);
     }
 
-    let mut new_ids: Vec<i64> = Vec::new();
-    let mut skipped = 0usize;
+    // Register tracked folder
+    conn.execute(
+        "INSERT OR IGNORE INTO tracked_folders (path) VALUES (?1)",
+        params![expanded],
+    )?;
 
-    for pdf in &pdfs {
-        let pdf_path = pdf.to_string_lossy().to_string();
-        let exists: bool = conn
+    // Load existing titles for dedup (case-insensitive)
+    let existing_titles: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT LOWER(name) FROM resources WHERE type='pdf'")?;
+        let rows: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows.into_iter().collect()
+    };
+
+    // Phase 1: extract metadata + classify
+    println!("Scanning {} PDFs...", pdf_pairs.len());
+
+    enum Status { New, DuplicateTitle, AlreadyByPath }
+    struct Candidate {
+        wsl_pdf: std::path::PathBuf,
+        win_pdf: std::path::PathBuf,
+        title: String,
+        author: Option<String>,
+        pages: u32,
+        status: Status,
+    }
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut seen_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let n = pdf_pairs.len();
+
+    for (i, (wsl_pdf, win_pdf)) in pdf_pairs.iter().enumerate() {
+        eprint!("\r  [{}/{}] Extracting metadata...", i + 1, n);
+
+        // Already tracked by path?
+        let path_key = if !wsl_pdf.as_os_str().is_empty() {
+            wsl_pdf.to_string_lossy().to_string()
+        } else {
+            win_pdf.to_string_lossy().to_string()
+        };
+        let by_path: bool = conn
             .query_row(
                 "SELECT COUNT(*) FROM resources WHERE type='pdf' AND path=?1",
-                params![pdf_path],
+                params![path_key],
                 |r| r.get::<_, u32>(0),
             )
-            .map(|c| c > 0)?;
-        if exists {
-            skipped += 1;
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if by_path {
+            candidates.push(Candidate {
+                wsl_pdf: wsl_pdf.clone(), win_pdf: win_pdf.clone(),
+                title: path_key, author: None, pages: 0,
+                status: Status::AlreadyByPath,
+            });
             continue;
         }
-        let name = pdf
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| pdf_path.clone());
-        let pages = lopdf::Document::load(pdf)
-            .ok()
-            .map(|d| d.get_pages().len() as u32)
-            .unwrap_or(0);
+
+        let (title, author, pages) = extract_pdf_metadata(wsl_pdf, win_pdf);
+        let title_lower = title.to_lowercase();
+
+        let status = if existing_titles.contains(&title_lower) || seen_titles.contains(&title_lower) {
+            Status::DuplicateTitle
+        } else {
+            seen_titles.insert(title_lower);
+            Status::New
+        };
+
+        candidates.push(Candidate { wsl_pdf: wsl_pdf.clone(), win_pdf: win_pdf.clone(), title, author, pages, status });
+    }
+    eprintln!();
+
+    let new_count  = candidates.iter().filter(|c| matches!(c.status, Status::New)).count();
+    let dup_count  = candidates.iter().filter(|c| matches!(c.status, Status::DuplicateTitle)).count();
+    let path_count = candidates.iter().filter(|c| matches!(c.status, Status::AlreadyByPath)).count();
+
+    println!("  Found {} PDFs:", candidates.len());
+    println!("    → {} new", new_count);
+    if dup_count  > 0 { println!("    → {} duplicate title (skipping)", dup_count); }
+    if path_count > 0 { println!("    → {} already tracked by path (skipping)", path_count); }
+
+    if new_count == 0 {
+        println!("Nothing to add.");
+        return Ok(());
+    }
+
+    // Phase 2: copy + insert New candidates
+    let mut inserted_ids: Vec<i64> = Vec::new();
+    let mut sample_titles: Vec<String> = Vec::new();
+    let new_candidates: Vec<&Candidate> = candidates.iter()
+        .filter(|c| matches!(c.status, Status::New))
+        .collect();
+
+    println!("Copying {} PDFs to local store...", new_count);
+    for (i, c) in new_candidates.iter().enumerate() {
+        let display: String = c.title.chars().take(50).collect();
+        eprint!("\r  [{}/{}] {}...", i + 1, new_count, display);
+
+        let local_path = match copy_pdf_to_store(&c.win_pdf, &c.wsl_pdf, &c.title, c.author.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("\n  Failed to copy '{}': {}", c.title, e);
+                continue;
+            }
+        };
+
+        let local_str = local_path.to_string_lossy().to_string();
         conn.execute(
             "INSERT INTO resources (type, name, path, pages) VALUES ('pdf', ?1, ?2, ?3)",
-            params![name, pdf_path, pages],
+            params![c.title, local_str, c.pages],
         )?;
         let id = conn.last_insert_rowid();
         apply_type_tags(conn, TYPE_PDF, id)?;
-        new_ids.push(id);
+        inserted_ids.push(id);
+        sample_titles.push(c.title.clone());
     }
+    eprintln!();
 
-    println!(
-        "Added {} PDFs from {} ({} already existed)",
-        new_ids.len(),
-        expanded,
-        skipped
-    );
-
-    if !new_ids.is_empty() {
-        eprint!("Building metadata for tagging...");
-        let metadata = build_pdf_metadata(&expanded);
-        eprintln!(" done");
-        let tags = get_folder_topic_tags(conn, &metadata)?;
-        if !tags.is_empty() {
-            for &id in &new_ids {
-                apply_named_tags(conn, id, &tags)?;
-            }
+    // One LLM tag call for the whole batch
+    if !inserted_ids.is_empty() {
+        let metadata = build_pdf_folder_metadata(&expanded, &sample_titles);
+        let confirmed_tags = suggest_topic_tags(conn, &metadata)?;
+        for id in &inserted_ids {
+            apply_named_tags(conn, *id, &confirmed_tags)?;
         }
     }
 
+    println!("Added {} PDFs from '{}'.", inserted_ids.len(), expanded);
     Ok(())
 }
 

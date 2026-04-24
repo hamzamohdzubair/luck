@@ -118,11 +118,214 @@ pub fn build_pdf_metadata(path: &str) -> String {
                 meta.push_str(&format!("\nPDF metadata: {}", info));
             }
         }
-        if let Ok(text) = pdf_extract::extract_text(pdf_path) {
-            let preview: String = text.split_whitespace().take(250).collect::<Vec<_>>().join(" ");
-            if !preview.is_empty() {
-                meta.push_str(&format!("\nContent preview: {}", preview));
+    }
+    meta
+}
+
+fn decode_pdf_string(bytes: &[u8]) -> Option<String> {
+    let s = if bytes.starts_with(&[0xFE, 0xFF]) {
+        // UTF-16BE with BOM
+        let pairs: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&pairs)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    let s = s.trim().to_string();
+
+    // Reject obviously bad values
+    let sl = s.to_lowercase();
+    if s.is_empty() || sl == "na" || sl == "untitled" || sl == "unknown" || sl == "none" {
+        return None;
+    }
+    // Reject authoring-tool source filenames stored as titles
+    if sl.ends_with(".indd") || sl.ends_with(".docx") || sl.ends_with(".pages")
+        || sl.ends_with(".doc") || sl.ends_with(".odt")
+    {
+        return None;
+    }
+    // Reject purely numeric strings (ISBNs, internal IDs)
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // Reject strings with too many non-printable or replacement chars (binary data)
+    let total = s.chars().count();
+    let printable = s.chars().filter(|c| !c.is_control() && *c != '\u{FFFD}').count();
+    if total == 0 || (printable as f64 / total as f64) < 0.8 {
+        return None;
+    }
+    Some(s)
+}
+
+pub fn extract_pdf_title_author(doc: &lopdf::Document) -> (Option<String>, Option<String>) {
+    let info_ref = match doc.trailer.get(b"Info").ok().and_then(|o| o.as_reference().ok()) {
+        Some(r) => r,
+        None => return (None, None),
+    };
+    let obj = match doc.get_object(info_ref) {
+        Ok(o) => o,
+        Err(_) => return (None, None),
+    };
+    if let lopdf::Object::Dictionary(dict) = obj {
+        let get_field = |key: &[u8]| -> Option<String> {
+            let val = dict.get(key).ok()?;
+            let bytes = val.as_str().ok()?;
+            decode_pdf_string(bytes)
+        };
+        return (get_field(b"Title"), get_field(b"Author"));
+    }
+    (None, None)
+}
+
+/// Extract an ISBN-13 from PDF content streams (pages 1–5).
+/// Scans raw bytes for 13-digit sequences starting with 978 or 979.
+pub fn extract_isbn_from_doc(doc: &lopdf::Document) -> Option<String> {
+    let pages = doc.get_pages();
+    for (page_num, page_id) in pages.iter().take(5) {
+        let _ = page_num;
+        let content_bytes = match doc.get_page_content(*page_id) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if let Some(isbn) = find_isbn13_in_bytes(&content_bytes) {
+            return Some(isbn);
+        }
+    }
+    None
+}
+
+fn find_isbn13_in_bytes(bytes: &[u8]) -> Option<String> {
+    // Walk through bytes looking for 13-digit ASCII sequences starting with 978 or 979
+    let s = String::from_utf8_lossy(bytes);
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if !c.is_ascii_digit() {
+            continue;
+        }
+        // Collect up to 13 consecutive digits (skip hyphens/spaces commonly inserted in ISBNs)
+        let mut digits = String::new();
+        let mut j = i;
+        for ch in s[i..].chars() {
+            if ch.is_ascii_digit() {
+                digits.push(ch);
+                if digits.len() == 13 {
+                    break;
+                }
+            } else if ch == '-' || ch == ' ' || ch == '\u{00A0}' {
+                // allow separators within ISBN
+                if digits.len() >= 1 && digits.len() <= 12 {
+                    continue;
+                } else {
+                    break;
+                }
+            } else {
+                break;
             }
+            j += ch.len_utf8();
+        }
+        if digits.len() == 13
+            && (digits.starts_with("978") || digits.starts_with("979"))
+            && isbn13_valid(&digits)
+        {
+            // Confirm not preceded/followed by more digits (avoid grabbing from longer numbers)
+            let before_ok = i == 0 || !s[..i].ends_with(|c: char| c.is_ascii_digit());
+            let after_end = i + j - i + 1;
+            let after_ok = after_end >= s.len()
+                || !s[after_end..].starts_with(|c: char| c.is_ascii_digit());
+            let _ = after_ok; // boundary check is best-effort
+            if before_ok {
+                return Some(digits);
+            }
+        }
+    }
+    None
+}
+
+fn isbn13_valid(isbn: &str) -> bool {
+    if isbn.len() != 13 { return false; }
+    let sum: u32 = isbn.chars().enumerate().filter_map(|(i, c)| {
+        c.to_digit(10).map(|d| if i % 2 == 0 { d } else { d * 3 })
+    }).sum();
+    sum % 10 == 0
+}
+
+/// Look up a book by ISBN-13 via Open Library Books API.
+/// Returns canonical title and first author if found.
+pub fn lookup_book_by_isbn(isbn: &str) -> Option<(String, Option<String>)> {
+    let url = format!(
+        "https://openlibrary.org/api/books?bibkeys=ISBN:{}&format=json&jscmd=data",
+        isbn
+    );
+    let resp = ureq::get(&url)
+        .set("User-Agent", "luck-cli/2.0 (hamzamohdzubair@gmail.com)")
+        .timeout(std::time::Duration::from_secs(8))
+        .call()
+        .ok()?;
+    let json: serde_json::Value = resp.into_json().ok()?;
+    let key = format!("ISBN:{}", isbn);
+    let book = json.get(&key)?;
+    let title = book["title"].as_str()?.to_string();
+    let author = book["authors"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v["name"].as_str())
+        .map(|s| s.to_string());
+    Some((title, author))
+}
+
+/// Look up a book's canonical title and first author via the Open Library Search API.
+/// Uses the provided hint (filename stem or rough title) as the search query.
+/// Returns None on network error, timeout, or no results.
+pub fn lookup_book_title_online(hint: &str) -> Option<(String, Option<String>)> {
+    // Build a clean query: first 6 meaningful words, alphanumeric only
+    let noise: &[&str] = &["pdfdrive", "zlibrary", "libgen", "bookfi", "com", "org", "pdf"];
+    let query: String = hint
+        .split(|c: char| !c.is_alphanumeric() && c != '-')
+        .filter(|w| !w.is_empty())
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            !noise.contains(&lower.as_str())
+        })
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("+");
+
+    if query.split('+').filter(|w| w.chars().any(|c| c.is_alphabetic())).count() < 2 {
+        return None; // not enough real words (e.g. pure numeric filenames)
+    }
+
+    let url = format!(
+        "https://openlibrary.org/search.json?q={}&fields=title,author_name&limit=1",
+        query
+    );
+
+    let resp = ureq::get(&url)
+        .set("User-Agent", "luck-cli/2.0 (hamzamohdzubair@gmail.com)")
+        .timeout(std::time::Duration::from_secs(8))
+        .call()
+        .ok()?;
+
+    let json: serde_json::Value = resp.into_json().ok()?;
+    let doc = json["docs"].as_array()?.first()?;
+
+    let title = doc["title"].as_str()?.to_string();
+    let author = doc["author_name"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    Some((title, author))
+}
+
+pub fn build_pdf_folder_metadata(folder_path: &str, sample_titles: &[String]) -> String {
+    let mut meta = format!("Folder: {}", folder_path);
+    if !sample_titles.is_empty() {
+        meta.push_str("\nSample titles:");
+        for t in sample_titles.iter().take(10) {
+            meta.push_str(&format!("\n- {}", t));
         }
     }
     meta
@@ -150,11 +353,13 @@ fn extract_pdf_info(doc: &lopdf::Document) -> Option<String> {
     None
 }
 
-pub fn get_folder_topic_tags(conn: &Connection, metadata: &str) -> Result<Vec<String>> {
+
+pub fn suggest_topic_tags(conn: &Connection, metadata: &str) -> Result<Vec<String>> {
     let vocab = get_topic_vocab(conn)?;
     if vocab.is_empty() {
         return Ok(vec![]);
     }
+
     let suggested = match detect_api() {
         Some(api) => {
             eprint!("Tagging...");
@@ -173,6 +378,7 @@ pub fn get_folder_topic_tags(conn: &Connection, metadata: &str) -> Result<Vec<St
             vec![]
         }
     };
+
     confirm_tags(suggested, &vocab)
 }
 
@@ -181,20 +387,26 @@ pub fn prompt_and_apply_topic_tags(
     id: i64,
     metadata: &str,
 ) -> Result<()> {
+    let confirmed = suggest_topic_tags(conn, metadata)?;
+    apply_named_tags(conn, id, &confirmed)?;
+    Ok(())
+}
+
+pub fn auto_apply_topic_tags(conn: &Connection, id: i64, metadata: &str) -> Result<()> {
     let vocab = get_topic_vocab(conn)?;
     if vocab.is_empty() {
         return Ok(());
     }
 
-    let suggested = match detect_api() {
+    let tags = match detect_api() {
         Some(api) => {
             eprint!("Tagging...");
-            let tags = call_llm_for_tags(&api, metadata, &vocab).unwrap_or_else(|e| {
+            let t = call_llm_for_tags(&api, metadata, &vocab).unwrap_or_else(|e| {
                 eprintln!(" (LLM error: {})", e);
                 vec![]
             });
             eprintln!(" done");
-            tags
+            t
         }
         None => {
             eprintln!(
@@ -205,8 +417,11 @@ pub fn prompt_and_apply_topic_tags(
         }
     };
 
-    let confirmed = confirm_tags(suggested, &vocab)?;
-    apply_named_tags(conn, id, &confirmed)?;
+    if !tags.is_empty() {
+        let display: Vec<String> = tags.iter().map(|t| format!("#{}", t)).collect();
+        println!("  Tags: {}", display.join(" "));
+        apply_named_tags(conn, id, &tags)?;
+    }
     Ok(())
 }
 

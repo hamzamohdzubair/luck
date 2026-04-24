@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::resources::migrate_expand_pdf_folders;
+use crate::resources::{migrate_expand_pdf_folders, migrate_expand_pdf_folders_v2};
 use crate::tags::{TYPE_TAG_MAP, DEFAULT_TOPIC_TAGS};
 
 pub fn get_db_path() -> Result<PathBuf> {
@@ -55,6 +55,12 @@ pub fn open_db() -> Result<Connection> {
         CREATE TABLE IF NOT EXISTS migrations (
             name TEXT PRIMARY KEY
         );
+        CREATE TABLE IF NOT EXISTS tracked_folders (
+            id             INTEGER PRIMARY KEY,
+            path           TEXT NOT NULL UNIQUE,
+            added_at       INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            last_synced_at INTEGER
+        );
     ")?;
 
     seed_tags(&conn)?;
@@ -69,6 +75,7 @@ pub fn open_db() -> Result<Connection> {
     migrate_dir_resources(&conn)?;
     cleanup_dir_tag(&conn)?;
     migrate_expand_pdf_folders(&conn)?;
+    migrate_expand_pdf_folders_v2(&conn)?;
 
     Ok(conn)
 }
@@ -276,4 +283,13 @@ pub fn increment_pick_count(conn: &Connection, resource_id: i64) -> Result<()> {
         params![resource_id],
     )?;
     Ok(())
+}
+
+pub fn get_tracked_folders(conn: &Connection) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare("SELECT id, path FROM tracked_folders ORDER BY id")?;
+    let v: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(v)
 }

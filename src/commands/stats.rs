@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use std::collections::HashMap;
 
 use crate::db::count_all_resources;
@@ -13,7 +13,8 @@ pub struct TagStat {
     pub is_leaf_type: bool,
     pub weight: f64,
     pub count: i64,
-    pub entries: String,
+    pub entries: i64,
+    pub summary: String,
     pub picks: i64,
     pub curr_prob: f64,
     pub whatif_prob: f64,
@@ -65,14 +66,12 @@ fn entries_desc(conn: &Connection, name: &str, count: i64) -> String {
             else { format!("{}vid, {}pl", total_vids, pls) }
         }
         "pdf" => {
-            let docs: i64 = conn.query_row(
-                "SELECT COALESCE(SUM(pdf_count),0) FROM pdf_scan_cache", [], |r| r.get(0),
-            ).unwrap_or(0);
             let pages: i64 = conn.query_row(
-                "SELECT COALESCE(SUM(total_pages),0) FROM pdf_scan_cache", [], |r| r.get(0),
+                "SELECT COALESCE(SUM(pages),0) FROM resources WHERE type='pdf'",
+                [], |r| r.get(0),
             ).unwrap_or(0);
-            if docs > 0 { format!("{}dir, {}doc, {}pg", count, docs, pages) }
-            else { format!("{}dir", count) }
+            if pages > 0 { format!("{}pdf, {}pg", count, pages) }
+            else { format!("{}pdf", count) }
         }
         "physical" => {
             let pages: i64 = conn.query_row(
@@ -82,27 +81,114 @@ fn entries_desc(conn: &Connection, name: &str, count: i64) -> String {
             format!("{}bk, {}pg", count, pages)
         }
         "book" => {
-            let dirs: i64 = conn.query_row(
+            let pdfs: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM resources WHERE type='pdf'", [], |r| r.get(0),
             ).unwrap_or(0);
-            let docs: i64 = conn.query_row(
-                "SELECT COALESCE(SUM(pdf_count),0) FROM pdf_scan_cache", [], |r| r.get(0),
+            let pdf_pages: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(pages),0) FROM resources WHERE type='pdf'",
+                [], |r| r.get(0),
             ).unwrap_or(0);
             let bks: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM resources WHERE type='book'", [], |r| r.get(0),
             ).unwrap_or(0);
-            let pages: i64 = conn.query_row(
-                "SELECT COALESCE(SUM(total_pages),0) FROM pdf_scan_cache", [], |r| r.get(0),
-            ).unwrap_or(0) + conn.query_row(
+            let bk_pages: i64 = conn.query_row(
                 "SELECT COALESCE(SUM(pages),0) FROM resources WHERE type='book'",
                 [], |r| r.get(0),
             ).unwrap_or(0);
-            if docs > 0 { format!("{}dir, {}doc, {}bk, {}pg", dirs, docs, bks, pages) }
-            else { format!("{}dir, {}bk, {}pg", dirs, bks, pages) }
+            format!("{}pdf, {}bk, {}pg", pdfs, bks, pdf_pages + bk_pages)
         }
         "link" => format!("{}lnk", count),
         _ => count.to_string(),
     }
+}
+
+fn topic_entries_desc(conn: &Connection, tag_id: i64, count: i64) -> String {
+    let playlists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resources r \
+         JOIN resource_tags rt ON rt.resource_id = r.id \
+         WHERE rt.tag_id = ?1 AND r.type = 'playlist'",
+        params![tag_id], |r| r.get(0),
+    ).unwrap_or(0);
+    let pl_videos: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(r.video_count),0) FROM resources r \
+         JOIN resource_tags rt ON rt.resource_id = r.id \
+         WHERE rt.tag_id = ?1 AND r.type = 'playlist'",
+        params![tag_id], |r| r.get(0),
+    ).unwrap_or(0);
+    let videos: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resources r \
+         JOIN resource_tags rt ON rt.resource_id = r.id \
+         WHERE rt.tag_id = ?1 AND r.type = 'video'",
+        params![tag_id], |r| r.get(0),
+    ).unwrap_or(0);
+    let video_secs: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(d.duration_secs),0) FROM resources r \
+         JOIN resource_tags rt ON rt.resource_id = r.id \
+         JOIN yt_duration_cache d ON d.url = r.url \
+         WHERE rt.tag_id = ?1 AND r.type IN ('video', 'playlist')",
+        params![tag_id], |r| r.get(0),
+    ).unwrap_or(0);
+    let pdfs: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resources r \
+         JOIN resource_tags rt ON rt.resource_id = r.id \
+         WHERE rt.tag_id = ?1 AND r.type = 'pdf'",
+        params![tag_id], |r| r.get(0),
+    ).unwrap_or(0);
+    let pdf_pages: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(r.pages), 0) FROM resources r \
+         JOIN resource_tags rt ON rt.resource_id = r.id \
+         WHERE rt.tag_id = ?1 AND r.type = 'pdf'",
+        params![tag_id], |r| r.get(0),
+    ).unwrap_or(0);
+    let books: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resources r \
+         JOIN resource_tags rt ON rt.resource_id = r.id \
+         WHERE rt.tag_id = ?1 AND r.type = 'book'",
+        params![tag_id], |r| r.get(0),
+    ).unwrap_or(0);
+    let book_pages: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(r.pages),0) FROM resources r \
+         JOIN resource_tags rt ON rt.resource_id = r.id \
+         WHERE rt.tag_id = ?1 AND r.type = 'book'",
+        params![tag_id], |r| r.get(0),
+    ).unwrap_or(0);
+    let links: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resources r \
+         JOIN resource_tags rt ON rt.resource_id = r.id \
+         WHERE rt.tag_id = ?1 AND r.type = 'link'",
+        params![tag_id], |r| r.get(0),
+    ).unwrap_or(0);
+
+    let total_vids = videos + pl_videos;
+    let total_pages = pdf_pages + book_pages;
+    let mut parts = Vec::new();
+    if playlists > 0 { parts.push(format!("{}pl", playlists)); }
+    if total_vids > 0 { parts.push(format!("{}vid", total_vids)); }
+    if video_secs > 0 { parts.push(format_hm(video_secs as u64)); }
+    if pdfs > 0 { parts.push(format!("{}pdf", pdfs)); }
+    if books > 0 { parts.push(format!("{}bk", books)); }
+    if total_pages > 0 { parts.push(format!("{}pg", total_pages)); }
+    if links > 0 { parts.push(format!("{}lnk", links)); }
+
+    if parts.is_empty() { count.to_string() } else { parts.join(", ") }
+}
+
+fn tag_entry_count(conn: &Connection, tag_id: i64) -> i64 {
+    let non_pdf: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resources r \
+         JOIN resource_tags rt ON rt.resource_id = r.id \
+         WHERE rt.tag_id = ?1 AND r.type != 'pdf'",
+        params![tag_id], |r| r.get(0),
+    ).unwrap_or(0);
+
+    let pdf_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resources r \
+         JOIN resource_tags rt ON rt.resource_id = r.id \
+         WHERE rt.tag_id = ?1 AND r.type = 'pdf'",
+        params![tag_id], |r| r.get(0),
+    ).unwrap_or(0);
+
+    non_pdf + pdf_count
 }
 
 pub fn load_tag_stats(conn: &Connection) -> Result<Vec<TagStat>> {
@@ -187,15 +273,16 @@ pub fn load_tag_stats(conn: &Connection) -> Result<Vec<TagStat>> {
                 None
             };
 
-            let entries = if is_type_tag {
+            let summary = if is_type_tag {
                 entries_desc(conn, name, count)
             } else {
-                count.to_string()
+                topic_entries_desc(conn, *id, count)
             };
+            let entries = tag_entry_count(conn, *id);
 
             let picks = tag_picks.get(id).copied().unwrap_or(0);
 
-            TagStat { id: *id, name: name.clone(), is_type_tag, is_leaf_type, weight: *weight, count, entries, picks, curr_prob, whatif_prob, uniform_weight }
+            TagStat { id: *id, name: name.clone(), is_type_tag, is_leaf_type, weight: *weight, count, entries, summary, picks, curr_prob, whatif_prob, uniform_weight }
         })
         .collect();
 
@@ -221,17 +308,18 @@ pub fn cmd_stats(conn: &Connection) -> Result<()> {
     }
 
     let tag_w     = stats.iter().map(|s| s.name.len() + 1).max().unwrap_or(5).max(5);
-    let entries_w = "Entries".len().max(stats.iter().map(|s| s.entries.len()).max().unwrap_or(0));
+    let entries_w = "Entries".len().max(stats.iter().map(|s| s.entries.to_string().len()).max().unwrap_or(0));
+    let summary_w = "Summary".len().max(stats.iter().map(|s| s.summary.len()).max().unwrap_or(0));
     let picks_w   = "Picks".len().max(stats.iter().map(|s| s.picks.to_string().len()).max().unwrap_or(0));
 
-    let total_w = tag_w + 2 + entries_w + 2 + picks_w + 2 + 6 + 2 + 7 + 2 + 6 + 2 + 7 + 2;
+    let total_w = tag_w + 2 + entries_w + 2 + summary_w + 2 + picks_w + 2 + 6 + 2 + 7 + 2 + 6 + 2 + 7 + 2;
     let sep = "─".repeat(total_w);
 
     println!("{}", sep);
     println!(
-        " {:<tag_w$}  {:<entries_w$}  {:>picks_w$}  {:>6}  {:>7}  {:>6}  {:>7}",
-        "TAG", "ENTRIES", "PICKS", "WEIGHT", "CURR%", "BASE%", "UNIF-W",
-        tag_w = tag_w, entries_w = entries_w, picks_w = picks_w
+        " {:<tag_w$}  {:>entries_w$}  {:<summary_w$}  {:>picks_w$}  {:>6}  {:>7}  {:>6}  {:>7}",
+        "TAG", "ENTRIES", "SUMMARY", "PICKS", "WEIGHT", "CURR%", "BASE%", "UNIF-W",
+        tag_w = tag_w, entries_w = entries_w, summary_w = summary_w, picks_w = picks_w
     );
 
     let print_row = |s: &TagStat| {
@@ -240,9 +328,9 @@ pub fn cmd_stats(conn: &Connection) -> Result<()> {
             .uniform_weight
             .map_or("  -  ".to_string(), |w| format!("{:>6.2}", w));
         println!(
-            " {:<tag_w$}  {:<entries_w$}  {:>picks_w$}  {:>6.2}  {:>6.1}%  {:>5.1}%  {}",
-            tag_label, s.entries, s.picks, s.weight, s.curr_prob * 100.0, s.whatif_prob * 100.0, unif,
-            tag_w = tag_w, entries_w = entries_w, picks_w = picks_w
+            " {:<tag_w$}  {:>entries_w$}  {:<summary_w$}  {:>picks_w$}  {:>6.2}  {:>6.1}%  {:>5.1}%  {}",
+            tag_label, s.entries, s.summary, s.picks, s.weight, s.curr_prob * 100.0, s.whatif_prob * 100.0, unif,
+            tag_w = tag_w, entries_w = entries_w, summary_w = summary_w, picks_w = picks_w
         );
     };
 

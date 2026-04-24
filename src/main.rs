@@ -16,6 +16,7 @@ use commands::{
     retag::cmd_retag,
     rm::rm,
     stats::cmd_stats,
+    sync::cmd_sync,
     topics::{cmd_tag, cmd_topics, TopicsSubcommand},
     weights::cmd_weights,
 };
@@ -80,6 +81,8 @@ enum Commands {
     Ls { tag: String },
     /// Interactive tag weight editor
     Weights,
+    /// Sync tracked PDF folders for new additions
+    Sync,
     /// Apply topic tags to resources. No args = untagged only; --all = every resource; <id> or <tag> = targeted
     Retag {
         /// Resource ID or tag name to retag
@@ -87,6 +90,9 @@ enum Commands {
         /// Retag all resources, even those already tagged
         #[arg(short = 'a', long = "all")]
         all: bool,
+        /// Auto-accept LLM suggestions without confirmation prompts
+        #[arg(short = 'f', long = "force")]
+        force: bool,
     },
 }
 
@@ -153,7 +159,7 @@ fn pick(filter: Option<String>) -> Result<()> {
     let idx = dist.sample(&mut rng);
     let resource = candidates[idx];
 
-    dispatch_resource(resource, &mut rng)?;
+    dispatch_resource(&conn, resource, &mut rng)?;
     increment_pick_count(&conn, resource.id())?;
     Ok(())
 }
@@ -195,7 +201,11 @@ fn main() -> Result<()> {
             let conn = open_db()?;
             cmd_weights(&conn)?;
         }
-        Commands::Retag { target, all } => cmd_retag(target, all)?,
+        Commands::Sync => {
+            let conn = open_db()?;
+            cmd_sync(&conn)?;
+        }
+        Commands::Retag { target, all, force } => cmd_retag(target, all, force)?,
     }
     Ok(())
 }
