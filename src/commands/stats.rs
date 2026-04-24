@@ -300,7 +300,7 @@ pub fn load_tag_stats(conn: &Connection) -> Result<Vec<TagStat>> {
     Ok(stats)
 }
 
-pub fn cmd_stats(conn: &Connection) -> Result<()> {
+pub fn cmd_stats(conn: &Connection, sort_by_curr: bool) -> Result<()> {
     let stats = load_tag_stats(conn)?;
     if stats.is_empty() {
         println!("No tags yet.");
@@ -334,8 +334,13 @@ pub fn cmd_stats(conn: &Connection) -> Result<()> {
         );
     };
 
-    let type_stats: Vec<_> = stats.iter().filter(|s| s.is_type_tag).collect();
-    let topic_stats: Vec<_> = stats.iter().filter(|s| !s.is_type_tag).collect();
+    let mut type_stats: Vec<_> = stats.iter().filter(|s| s.is_type_tag).collect();
+    let mut topic_stats: Vec<_> = stats.iter().filter(|s| !s.is_type_tag).collect();
+
+    if sort_by_curr {
+        type_stats.sort_by(|a, b| b.curr_prob.partial_cmp(&a.curr_prob).unwrap_or(std::cmp::Ordering::Equal));
+        topic_stats.sort_by(|a, b| b.curr_prob.partial_cmp(&a.curr_prob).unwrap_or(std::cmp::Ordering::Equal));
+    }
 
     if !type_stats.is_empty() {
         println!("{}", sep);

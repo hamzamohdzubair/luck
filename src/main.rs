@@ -65,7 +65,11 @@ enum Commands {
         name: Option<String>,
     },
     /// Show tag statistics
-    Stats,
+    Stats {
+        /// Sort each section by descending current %
+        #[arg(short = 's', long = "sort")]
+        sort: bool,
+    },
     /// Manage topic tag vocabulary
     Topics {
         #[command(subcommand)]
@@ -176,9 +180,9 @@ fn main() -> Result<()> {
         }
         Commands::Add { from_clipboard, dir, pages, name } =>
             add(from_clipboard, dir, pages, name)?,
-        Commands::Stats => {
+        Commands::Stats { sort } => {
             let conn = open_db()?;
-            cmd_stats(&conn)?;
+            cmd_stats(&conn, sort)?;
         }
         Commands::Topics { subcommand } => {
             let conn = open_db()?;
