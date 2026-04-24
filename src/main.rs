@@ -214,17 +214,8 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::{fmt_num, format_duration, format_hm, first_line, wsl_path, to_windows_path};
+    use crate::utils::{format_duration, format_hm, first_line, wsl_path, to_windows_path};
     use std::path::PathBuf;
-
-    #[test]
-    fn fmt_num_zero() { assert_eq!(fmt_num(0), "0"); }
-    #[test]
-    fn fmt_num_under_thousand() { assert_eq!(fmt_num(999), "999"); }
-    #[test]
-    fn fmt_num_exact_thousand() { assert_eq!(fmt_num(1000), "1,000"); }
-    #[test]
-    fn fmt_num_millions() { assert_eq!(fmt_num(1_234_567), "1,234,567"); }
 
     #[test]
     fn format_hm_zero() { assert_eq!(format_hm(0), "0h 00m"); }

@@ -57,18 +57,6 @@ pub fn books_dir() -> PathBuf {
     dir
 }
 
-pub fn fmt_num(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out.chars().rev().collect()
-}
-
 pub fn format_hm(seconds: u64) -> String {
     let h = seconds / 3600;
     let m = (seconds % 3600) / 60;
