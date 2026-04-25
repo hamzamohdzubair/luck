@@ -364,7 +364,7 @@ pub fn suggest_topic_tags(conn: &Connection, metadata: &str) -> Result<Vec<Strin
         Some(api) => {
             eprint!("Tagging...");
             let tags = call_llm_for_tags(&api, metadata, &vocab).unwrap_or_else(|e| {
-                eprintln!(" (LLM error: {})", e);
+                eprintln!(" (LLM error: {:#})", e);
                 vec![]
             });
             eprintln!(" done");
@@ -402,7 +402,7 @@ pub fn auto_apply_topic_tags(conn: &Connection, id: i64, metadata: &str) -> Resu
         Some(api) => {
             eprint!("Tagging...");
             let t = call_llm_for_tags(&api, metadata, &vocab).unwrap_or_else(|e| {
-                eprintln!(" (LLM error: {})", e);
+                eprintln!(" (LLM error: {:#})", e);
                 vec![]
             });
             eprintln!(" done");

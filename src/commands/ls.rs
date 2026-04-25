@@ -142,7 +142,7 @@ fn expand_rows(conn: &Connection, raw: Vec<RawRow>) -> Vec<Row> {
 
 // ── Render ────────────────────────────────────────────────────────────────────
 
-fn render(rows: &[Row], tag: &str) -> String {
+fn render(rows: &[Row], label: &str) -> String {
     let tw = term_width();
 
     let id_w    = rows.iter().map(|r| format!("{}", r.id).len()).max().unwrap_or(2).max(2);
@@ -158,7 +158,7 @@ fn render(rows: &[Row], tag: &str) -> String {
     let mut buf = String::new();
 
     buf.push_str(&format!(
-        "  {FG_TITLE}{BOLD}#{tag}{RESET}  {DIM}{} entries{RESET}\n",
+        "  {FG_TITLE}{BOLD}{label}{RESET}  {DIM}{} entries{RESET}\n",
         rows.len()
     ));
 
@@ -192,52 +192,91 @@ fn render(rows: &[Row], tag: &str) -> String {
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
-pub fn cmd_ls(conn: &Connection, tag: &str) -> Result<()> {
-    let tag_id: Option<i64> = conn.query_row(
-        "SELECT id FROM tags WHERE name = ?1", params![tag], |r| r.get(0),
-    ).ok();
+fn map_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
+    Ok(RawRow {
+        id:          r.get(0)?,
+        rtype:       r.get(1)?,
+        name:        r.get(2)?,
+        url:         r.get(3)?,
+        path:        r.get(4)?,
+        pages:       r.get(5)?,
+        video_count: r.get(6)?,
+        picks:       r.get(7)?,
+        tags:        r.get(8)?,
+    })
+}
 
-    let Some(tag_id) = tag_id else {
-        anyhow::bail!("Unknown tag '{}'. Use `luck topics add {}` to add it.", tag, tag);
+const SELECT_COLS: &str =
+    "SELECT r.id, r.type, r.name, r.url, r.path, r.pages, r.video_count, r.pick_count, \
+     (SELECT GROUP_CONCAT(t2.name, ', ') \
+      FROM resource_tags rt2 JOIN tags t2 ON t2.id = rt2.tag_id \
+      WHERE rt2.resource_id = r.id \
+      AND t2.name NOT IN ('video','playlist','youtube','pdf','physical','book','link') \
+     ) AS topic_tags ";
+
+pub fn cmd_ls(conn: &Connection, args: &[&str]) -> Result<()> {
+    // Join all args, split on commas, trim — handles both "tag1, tag2" and "tag1,tag2"
+    let joined = args.join(" ");
+    let tags: Vec<&str> = joined.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+
+    let (label, raw): (String, Vec<RawRow>) = if tags.is_empty() {
+        let sql = format!("{SELECT_COLS}FROM resources r ORDER BY r.id");
+        let mut stmt = conn.prepare(&sql)?;
+        let raw = stmt.query_map([], map_row)?.filter_map(|r| r.ok()).collect();
+        ("all".to_string(), raw)
+    } else if tags.len() == 1 && tags[0].bytes().all(|b| b.is_ascii_digit()) {
+        let id: i64 = tags[0].parse()?;
+        let sql = format!("{SELECT_COLS}FROM resources r WHERE r.id = ?1");
+        let mut stmt = conn.prepare(&sql)?;
+        let raw: Vec<RawRow> = stmt.query_map(params![id], map_row)?.filter_map(|r| r.ok()).collect();
+        if raw.is_empty() {
+            anyhow::bail!("No resource with ID {}.", id);
+        }
+        (format!("#{}", id), raw)
+    } else {
+        let mut tag_ids: Vec<i64> = Vec::new();
+        for tag in &tags {
+            match conn.query_row("SELECT id FROM tags WHERE name = ?1", params![*tag], |r| r.get(0)) {
+                Ok(id) => tag_ids.push(id),
+                Err(_) => anyhow::bail!("Unknown tag '{}'. Use `luck topics add {}` to add it.", tag, tag),
+            }
+        }
+        let placeholders: String = (1..=tag_ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+        let count_idx = tag_ids.len() + 1;
+        let sql = format!(
+            "{SELECT_COLS}FROM resources r \
+             WHERE r.id IN ( \
+                 SELECT resource_id FROM resource_tags \
+                 WHERE tag_id IN ({placeholders}) \
+                 GROUP BY resource_id \
+                 HAVING COUNT(DISTINCT tag_id) = ?{count_idx} \
+             ) ORDER BY r.id"
+        );
+        let mut all_params: Vec<i64> = tag_ids.clone();
+        all_params.push(tag_ids.len() as i64);
+        let mut stmt = conn.prepare(&sql)?;
+        let raw: Vec<RawRow> = stmt
+            .query_map(rusqlite::params_from_iter(all_params.iter()), map_row)?
+            .filter_map(|r| r.ok())
+            .collect();
+        let label = tags.iter().map(|t| format!("#{}", t)).collect::<Vec<_>>().join(", ");
+        if raw.is_empty() {
+            println!("No entries tagged {}.", label);
+            return Ok(());
+        }
+        (label, raw)
     };
 
-    let mut stmt = conn.prepare(
-        "SELECT r.id, r.type, r.name, r.url, r.path, r.pages, r.video_count, r.pick_count, \
-               (SELECT GROUP_CONCAT(t2.name, ', ') \
-                FROM resource_tags rt2 JOIN tags t2 ON t2.id = rt2.tag_id \
-                WHERE rt2.resource_id = r.id \
-                AND t2.name NOT IN ('video','playlist','youtube','pdf','physical','book','link') \
-               ) AS topic_tags \
-         FROM resources r \
-         JOIN resource_tags rt ON rt.resource_id = r.id \
-         WHERE rt.tag_id = ?1 \
-         ORDER BY r.id",
-    )?;
-
-    let raw: Vec<RawRow> = stmt
-        .query_map(params![tag_id], |r| {
-            Ok(RawRow {
-                id:          r.get::<_, i64>(0)?,
-                rtype:       r.get::<_, String>(1)?,
-                name:        r.get::<_, String>(2)?,
-                url:         r.get::<_, Option<String>>(3)?,
-                path:        r.get::<_, Option<String>>(4)?,
-                pages:       r.get::<_, Option<u32>>(5)?,
-                video_count: r.get::<_, Option<i64>>(6)?,
-                picks:       r.get::<_, i64>(7)?,
-                tags:        r.get::<_, Option<String>>(8)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
     if raw.is_empty() {
-        println!("No entries tagged #{}.", tag);
+        println!("No resources found. Add some with:");
+        println!("  luck add -l                     # YouTube video or playlist from clipboard");
+        println!("  luck add -n \"Title\" -p 300      # physical book");
+        println!("  luck add -d /path/to/folder     # PDF folder");
         return Ok(());
     }
 
     let rows = expand_rows(conn, raw);
-    let output = render(&rows, tag);
+    let output = render(&rows, &label);
 
     let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
     match std::process::Command::new(&pager)

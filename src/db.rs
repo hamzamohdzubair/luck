@@ -76,6 +76,7 @@ pub fn open_db() -> Result<Connection> {
     cleanup_dir_tag(&conn)?;
     migrate_expand_pdf_folders(&conn)?;
     migrate_expand_pdf_folders_v2(&conn)?;
+    add_source_path_column(&conn)?;
 
     Ok(conn)
 }
@@ -282,6 +283,18 @@ pub fn increment_pick_count(conn: &Connection, resource_id: i64) -> Result<()> {
         "UPDATE resources SET pick_count = pick_count + 1 WHERE id = ?1",
         params![resource_id],
     )?;
+    Ok(())
+}
+
+fn add_source_path_column(conn: &Connection) -> Result<()> {
+    let needed = conn.execute(
+        "INSERT OR IGNORE INTO migrations (name) VALUES ('add_source_path_column')",
+        [],
+    )? > 0;
+    if !needed {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE resources ADD COLUMN source_path TEXT")?;
     Ok(())
 }
 

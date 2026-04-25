@@ -81,8 +81,11 @@ enum Commands {
         #[arg(required = true, num_args = 1..)]
         tags: Vec<String>,
     },
-    /// List all entries for a tag with a pager
-    Ls { tag: String },
+    /// List entries: no arg = all, numeric = by ID, tag(s) = filter (comma-separated for AND)
+    Ls {
+        #[arg(num_args = 0..)]
+        args: Vec<String>,
+    },
     /// Interactive tag weight editor
     Weights,
     /// Sync tracked PDF folders for new additions
@@ -131,6 +134,21 @@ fn pick(filter: Option<String>) -> Result<()> {
     let conn = open_db()?;
 
     let all = load_all_resources(&conn)?;
+
+    // Numeric single-token filter = pick a specific resource by ID
+    if let Some(ref f) = filter {
+        let s = f.trim();
+        if !s.contains(',') {
+            if let Ok(id) = s.parse::<i64>() {
+                let resource = all.iter().find(|r| r.id() == id)
+                    .ok_or_else(|| anyhow::anyhow!("No resource with ID {}.", id))?;
+                let mut rng = rand::thread_rng();
+                dispatch_resource(&conn, resource, &mut rng)?;
+                increment_pick_count(&conn, resource.id())?;
+                return Ok(());
+            }
+        }
+    }
 
     let candidates: Vec<&resources::Resource> = if let Some(ref f) = filter {
         let tag_names: Vec<&str> = f.split(',').map(|t| t.trim()).collect();
@@ -197,9 +215,10 @@ fn main() -> Result<()> {
             let conn = open_db()?;
             cmd_tag(&conn, id, &tags)?;
         }
-        Commands::Ls { tag } => {
+        Commands::Ls { args } => {
             let conn = open_db()?;
-            cmd_ls(&conn, &tag)?;
+            let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            cmd_ls(&conn, &refs)?;
         }
         Commands::Weights => {
             let conn = open_db()?;

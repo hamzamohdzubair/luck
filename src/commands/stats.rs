@@ -173,6 +173,53 @@ fn topic_entries_desc(conn: &Connection, tag_id: i64, count: i64) -> String {
     if parts.is_empty() { count.to_string() } else { parts.join(", ") }
 }
 
+fn global_summary_desc(conn: &Connection) -> String {
+    let videos: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resources WHERE type='video'", [], |r| r.get(0),
+    ).unwrap_or(0);
+    let playlists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resources WHERE type='playlist'", [], |r| r.get(0),
+    ).unwrap_or(0);
+    let pl_videos: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(video_count),0) FROM resources WHERE type='playlist'",
+        [], |r| r.get(0),
+    ).unwrap_or(0);
+    let video_secs: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(d.duration_secs),0) FROM resources r \
+         JOIN yt_duration_cache d ON d.url=r.url WHERE r.type IN ('video','playlist')",
+        [], |r| r.get(0),
+    ).unwrap_or(0);
+    let pdfs: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resources WHERE type='pdf'", [], |r| r.get(0),
+    ).unwrap_or(0);
+    let pdf_pages: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(pages),0) FROM resources WHERE type='pdf'",
+        [], |r| r.get(0),
+    ).unwrap_or(0);
+    let books: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resources WHERE type='book'", [], |r| r.get(0),
+    ).unwrap_or(0);
+    let book_pages: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(pages),0) FROM resources WHERE type='book'",
+        [], |r| r.get(0),
+    ).unwrap_or(0);
+    let links: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resources WHERE type='link'", [], |r| r.get(0),
+    ).unwrap_or(0);
+
+    let total_vids = videos + pl_videos;
+    let total_pages = pdf_pages + book_pages;
+    let mut parts = Vec::new();
+    if playlists > 0 { parts.push(format!("{}pl", playlists)); }
+    if total_vids > 0 { parts.push(format!("{}vid", total_vids)); }
+    if video_secs > 0 { parts.push(format_hm(video_secs as u64)); }
+    if pdfs > 0 { parts.push(format!("{}pdf", pdfs)); }
+    if books > 0 { parts.push(format!("{}bk", books)); }
+    if total_pages > 0 { parts.push(format!("{}pg", total_pages)); }
+    if links > 0 { parts.push(format!("{}lnk", links)); }
+    parts.join(", ")
+}
+
 fn tag_entry_count(conn: &Connection, tag_id: i64) -> i64 {
     let non_pdf: i64 = conn.query_row(
         "SELECT COUNT(*) FROM resources r \
@@ -307,10 +354,22 @@ pub fn cmd_stats(conn: &Connection, sort_by_curr: bool) -> Result<()> {
         return Ok(());
     }
 
-    let tag_w     = stats.iter().map(|s| s.name.len() + 1).max().unwrap_or(5).max(5);
-    let entries_w = "Entries".len().max(stats.iter().map(|s| s.entries.to_string().len()).max().unwrap_or(0));
-    let summary_w = "Summary".len().max(stats.iter().map(|s| s.summary.len()).max().unwrap_or(0));
-    let picks_w   = "Picks".len().max(stats.iter().map(|s| s.picks.to_string().len()).max().unwrap_or(0));
+    let total_entries = count_all_resources(conn)?;
+    let total_summary = global_summary_desc(conn);
+    let total_picks: i64 = conn
+        .query_row("SELECT COALESCE(SUM(pick_count),0) FROM resources", [], |r| r.get(0))
+        .unwrap_or(0);
+
+    let tag_w     = stats.iter().map(|s| s.name.len() + 1).max().unwrap_or(5).max(5).max("total".len());
+    let entries_w = "Entries".len()
+        .max(stats.iter().map(|s| s.entries.to_string().len()).max().unwrap_or(0))
+        .max(total_entries.to_string().len());
+    let summary_w = "Summary".len()
+        .max(stats.iter().map(|s| s.summary.len()).max().unwrap_or(0))
+        .max(total_summary.len());
+    let picks_w   = "Picks".len()
+        .max(stats.iter().map(|s| s.picks.to_string().len()).max().unwrap_or(0))
+        .max(total_picks.to_string().len());
 
     let total_w = tag_w + 2 + entries_w + 2 + summary_w + 2 + picks_w + 2 + 6 + 2 + 7 + 2 + 6 + 2 + 7 + 2;
     let sep = "─".repeat(total_w);
@@ -319,6 +378,12 @@ pub fn cmd_stats(conn: &Connection, sort_by_curr: bool) -> Result<()> {
     println!(
         " {:<tag_w$}  {:>entries_w$}  {:<summary_w$}  {:>picks_w$}  {:>6}  {:>7}  {:>6}  {:>7}",
         "TAG", "ENTRIES", "SUMMARY", "PICKS", "WEIGHT", "CURR%", "BASE%", "UNIF-W",
+        tag_w = tag_w, entries_w = entries_w, summary_w = summary_w, picks_w = picks_w
+    );
+    println!("{}", sep);
+    println!(
+        " {:<tag_w$}  {:>entries_w$}  {:<summary_w$}  {:>picks_w$}  {:>6}  {:>7}  {:>6}  {:>7}",
+        "total", total_entries, total_summary, total_picks, "-", "-", "-", "-",
         tag_w = tag_w, entries_w = entries_w, summary_w = summary_w, picks_w = picks_w
     );
 

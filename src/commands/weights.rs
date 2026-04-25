@@ -30,8 +30,30 @@ pub struct WeightsState {
 }
 
 impl WeightsState {
+    // Visual row index of the separator between type and topic tags, if both exist.
+    pub fn separator_visual_idx(&self) -> Option<usize> {
+        let tc = self.stats.iter().filter(|s| s.is_type_tag).count();
+        if tc > 0 && tc < self.stats.len() { Some(tc) } else { None }
+    }
+
+    // Translate visual row index → stats slice index (None for the separator row).
+    pub fn visual_to_stats(&self, visual: usize) -> Option<usize> {
+        match self.separator_visual_idx() {
+            None => Some(visual),
+            Some(sep) if visual == sep => None,
+            Some(sep) if visual > sep => Some(visual - 1),
+            _ => Some(visual),
+        }
+    }
+
+    // Total number of visual rows (stats + optional separator).
+    pub fn visual_row_count(&self) -> usize {
+        self.stats.len() + self.separator_visual_idx().map_or(0, |_| 1)
+    }
+
+    // Currently selected stats index (adjusted past the separator).
     pub fn selected_idx(&self) -> Option<usize> {
-        self.table_state.selected()
+        self.table_state.selected().and_then(|v| self.visual_to_stats(v))
     }
 
     pub fn recompute_probs(&mut self) {
@@ -114,31 +136,43 @@ pub fn render_weights(f: &mut Frame, state: &mut WeightsState) {
         .constraints([Constraint::Min(5), Constraint::Length(2)])
         .split(area);
 
-    let selected = state.table_state.selected();
+    let selected_stats = state.selected_idx();
+    let sep_visual = state.separator_visual_idx();
 
-    let rows: Vec<Row> = state
-        .stats
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let weight_cell = if state.editing && selected == Some(i) {
-                format!("[{}▌]", state.edit_buf)
-            } else {
-                format!("{:.2}", s.weight)
-            };
-            let unif = s
-                .uniform_weight
-                .map_or("  -  ".to_string(), |w| format!("{:.2}", w));
-            Row::new(vec![
-                Cell::from(format!("#{}", s.name)),
-                Cell::from(format!("{:>5}", s.count)),
-                Cell::from(format!("{:>7}", weight_cell)),
-                Cell::from(format!("{:>5.1}%", s.curr_prob * 100.0)),
-                Cell::from(format!("{:>5.1}%", s.whatif_prob * 100.0)),
-                Cell::from(format!("{:>6}", unif)),
-            ])
-        })
-        .collect();
+    let mut rows: Vec<Row> = Vec::new();
+    for (i, s) in state.stats.iter().enumerate() {
+        if sep_visual == Some(i) {
+            rows.push(
+                Row::new(vec![
+                    Cell::from(" ─── topic tags").style(
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                    ),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ])
+                .style(Style::default().fg(Color::DarkGray)),
+            );
+        }
+        let weight_cell = if state.editing && selected_stats == Some(i) {
+            format!("[{}▌]", state.edit_buf)
+        } else {
+            format!("{:.2}", s.weight)
+        };
+        let unif = s
+            .uniform_weight
+            .map_or("  -  ".to_string(), |w| format!("{:.2}", w));
+        rows.push(Row::new(vec![
+            Cell::from(format!("#{}", s.name)),
+            Cell::from(format!("{:>5}", s.count)),
+            Cell::from(format!("{:>7}", weight_cell)),
+            Cell::from(format!("{:>5.1}%", s.curr_prob * 100.0)),
+            Cell::from(format!("{:>5.1}%", s.whatif_prob * 100.0)),
+            Cell::from(format!("{:>6}", unif)),
+        ]));
+    }
 
     let header = Row::new(vec![
         Cell::from("TAG").style(Style::default().add_modifier(Modifier::BOLD)),
@@ -257,19 +291,25 @@ pub fn cmd_weights(conn: &Connection) -> Result<()> {
                                 }
                             }
                             KeyCode::Down => {
-                                let n = state.stats.len();
-                                if n > 0 {
-                                    let next = state.selected_idx().map(|i| (i + 1) % n).unwrap_or(0);
+                                let total = state.visual_row_count();
+                                if total > 0 {
+                                    let sep = state.separator_visual_idx();
+                                    let next = state.table_state.selected().map_or(0, |v| {
+                                        let mut n = (v + 1) % total;
+                                        if sep == Some(n) { n = (n + 1) % total; }
+                                        n
+                                    });
                                     state.table_state.select(Some(next));
                                 }
                             }
                             KeyCode::Up => {
-                                let n = state.stats.len();
-                                if n > 0 {
-                                    let prev = state
-                                        .selected_idx()
-                                        .map(|i| if i == 0 { n - 1 } else { i - 1 })
-                                        .unwrap_or(0);
+                                let total = state.visual_row_count();
+                                if total > 0 {
+                                    let sep = state.separator_visual_idx();
+                                    let prev = state.table_state.selected().map_or(0, |v| {
+                                        let p = if v == 0 { total - 1 } else { v - 1 };
+                                        if sep == Some(p) { if p == 0 { total - 1 } else { p - 1 } } else { p }
+                                    });
                                     state.table_state.select(Some(prev));
                                 }
                             }

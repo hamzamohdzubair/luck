@@ -206,7 +206,7 @@ pub fn get_pdf_pages(conn: &Connection, pdf_path: &std::path::Path) -> u32 {
 
 /// Extract the filename stem from a path, handling Windows `\` separators correctly
 /// even when running on Linux where PathBuf only knows `/`.
-fn path_stem(path: &PathBuf) -> String {
+pub fn path_stem(path: &PathBuf) -> String {
     let s = path.to_string_lossy();
     let filename = s.rsplit(['\\', '/']).next().unwrap_or(&s);
     match filename.rfind('.') {

@@ -40,8 +40,10 @@ pub fn cmd_sync(conn: &Connection) -> Result<()> {
             continue;
         }
 
-        let existing_titles: HashSet<String> = {
-            let mut stmt = conn.prepare("SELECT LOWER(name) FROM resources WHERE type='pdf'")?;
+        let existing_source_paths: HashSet<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT source_path FROM resources WHERE source_path IS NOT NULL",
+            )?;
             let rows: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))?
                 .filter_map(|r| r.ok())
                 .collect();
@@ -50,17 +52,24 @@ pub fn cmd_sync(conn: &Connection) -> Result<()> {
 
         let mut added = 0usize;
         let mut skipped = 0usize;
-        let mut seen_titles: HashSet<String> = HashSet::new();
+        let mut seen_paths: HashSet<String> = HashSet::new();
 
         for (wsl_pdf, win_pdf) in &pdf_pairs {
-            let (title, author, pages) = extract_pdf_metadata(wsl_pdf, win_pdf);
-            let title_lower = title.to_lowercase();
+            let source_key = if !wsl_pdf.as_os_str().is_empty() {
+                wsl_pdf.to_string_lossy().to_string()
+            } else {
+                win_pdf.to_string_lossy().to_string()
+            };
 
-            if existing_titles.contains(&title_lower) || seen_titles.contains(&title_lower) {
+            if existing_source_paths.contains(&source_key) || seen_paths.contains(&source_key) {
+                let name = source_key.rsplit(['/', '\\']).next().unwrap_or(&source_key);
+                eprintln!("~ {} (skipped)", name);
                 skipped += 1;
                 continue;
             }
-            seen_titles.insert(title_lower);
+            seen_paths.insert(source_key.clone());
+
+            let (title, author, pages) = extract_pdf_metadata(wsl_pdf, win_pdf);
 
             let local_path = match copy_pdf_to_store(win_pdf, wsl_pdf, &title, author.as_deref()) {
                 Ok(p) => p,
@@ -72,8 +81,8 @@ pub fn cmd_sync(conn: &Connection) -> Result<()> {
 
             let local_str = local_path.to_string_lossy().to_string();
             conn.execute(
-                "INSERT INTO resources (type, name, path, pages) VALUES ('pdf', ?1, ?2, ?3)",
-                params![title, local_str, pages],
+                "INSERT INTO resources (type, name, path, pages, source_path) VALUES ('pdf', ?1, ?2, ?3, ?4)",
+                params![title, local_str, pages, source_key],
             )?;
             let id = conn.last_insert_rowid();
             apply_type_tags(conn, TYPE_PDF, id)?;
@@ -82,6 +91,7 @@ pub fn cmd_sync(conn: &Connection) -> Result<()> {
             let metadata = format!("Title: {}", title);
             auto_apply_topic_tags(conn, id, &metadata)?;
             added += 1;
+            std::thread::sleep(std::time::Duration::from_secs(2));
         }
 
         // Warn about missing local copies
